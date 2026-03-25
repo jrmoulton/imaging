@@ -26,7 +26,9 @@
 //!     }
 //!
 //!     let mut renderer = VelloCpuRenderer::new(128, 128);
-//!     let rgba = renderer.render_scene_rgba8(&scene)?;
+//!     renderer.reset();
+//!     renderer.render_scene(&scene)?;
+//!     let rgba = renderer.read_rgba8()?;
 //!     assert_eq!(rgba.len(), 128 * 128 * 4);
 //!     Ok(())
 //! }
@@ -35,7 +37,7 @@
 //! # Stream Commands Directly
 //!
 //! [`VelloCpuRenderer`] also implements [`imaging::PaintSink`], so you can stream commands
-//! directly and call [`VelloCpuRenderer::finish_rgba8`] when the frame is complete.
+//! directly and call [`VelloCpuRenderer::read_rgba8`] when the frame is complete.
 //!
 //! ```no_run
 //! use imaging::Painter;
@@ -52,7 +54,7 @@
 //!         painter.fill_rect(Rect::new(16.0, 16.0, 112.0, 112.0), &paint);
 //!     }
 //!
-//!     let rgba = renderer.finish_rgba8()?;
+//!     let rgba = renderer.read_rgba8()?;
 //!     assert_eq!(rgba.len(), 128 * 128 * 4);
 //!     Ok(())
 //! }
@@ -65,6 +67,7 @@ extern crate alloc;
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GeometryRef, GlyphRunRef, GroupRef,
@@ -160,16 +163,44 @@ impl VelloCpuRenderer {
         self.mask_cache.clear();
     }
 
-    /// Render a recorded scene and return an RGBA8 buffer (unpremultiplied).
-    pub fn render_scene_rgba8(&mut self, scene: &Scene) -> Result<Vec<u8>, Error> {
+    /// Replay a recorded scene onto the current render state.
+    pub fn render_scene(&mut self, scene: &Scene) -> Result<(), Error> {
         scene.validate().map_err(Error::InvalidScene)?;
-        self.reset();
         replay(scene, self);
-        self.finish_rgba8()
+        Ok(())
     }
 
-    /// Finish rendering the current command stream and return an RGBA8 buffer (unpremultiplied).
-    pub fn finish_rgba8(&mut self) -> Result<Vec<u8>, Error> {
+    /// Read back the current render state as an RGBA8 buffer (unpremultiplied).
+    pub fn read_rgba8(&mut self) -> Result<Vec<u8>, Error> {
+        let mut bytes = vec![0; usize::from(self.width) * usize::from(self.height) * 4];
+        self.read_into_rgba8_opaque(&mut bytes, usize::from(self.width) * 4)?;
+        Ok(bytes)
+    }
+
+    /// Read back the current render state into an opaque RGBA8 buffer.
+    pub fn read_into_rgba8_opaque(
+        &mut self,
+        dst: &mut [u8],
+        bytes_per_row: usize,
+    ) -> Result<(), Error> {
+        self.read_into_opaque(dst, bytes_per_row, ChannelOrder::Rgba)
+    }
+
+    /// Read back the current render state into an opaque BGRA8 buffer.
+    pub fn read_into_bgra8_opaque(
+        &mut self,
+        dst: &mut [u8],
+        bytes_per_row: usize,
+    ) -> Result<(), Error> {
+        self.read_into_opaque(dst, bytes_per_row, ChannelOrder::Bgra)
+    }
+
+    fn read_into_opaque(
+        &mut self,
+        dst: &mut [u8],
+        bytes_per_row: usize,
+        order: ChannelOrder,
+    ) -> Result<(), Error> {
         if let Some(err) = self.error.take() {
             return Err(err);
         }
@@ -185,11 +216,24 @@ impl VelloCpuRenderer {
         self.ctx.render_to_pixmap(&mut pixmap);
 
         let unpremul = pixmap.take_unpremultiplied();
-        let mut bytes = Vec::with_capacity(unpremul.len() * 4);
-        for p in unpremul {
-            bytes.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+        let width = usize::from(self.width);
+        let height = usize::from(self.height);
+        if dst.len() < bytes_per_row.saturating_mul(height) || bytes_per_row < width * 4 {
+            return Err(Error::Internal("destination buffer too small"));
         }
-        Ok(bytes)
+
+        for (src_row, dst_row) in unpremul
+            .chunks_exact(width)
+            .zip(dst.chunks_exact_mut(bytes_per_row))
+        {
+            for (src, out) in src_row.iter().zip(dst_row[..width * 4].chunks_exact_mut(4)) {
+                match order {
+                    ChannelOrder::Rgba => out.copy_from_slice(&[src.r, src.g, src.b, 0xff]),
+                    ChannelOrder::Bgra => out.copy_from_slice(&[src.b, src.g, src.r, 0xff]),
+                }
+            }
+        }
+        Ok(())
     }
 
     fn set_error_once(&mut self, err: Error) {
@@ -433,6 +477,12 @@ impl VelloCpuRenderer {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ChannelOrder {
+    Rgba,
+    Bgra,
+}
+
 #[inline]
 #[allow(
     clippy::cast_possible_truncation,
@@ -631,10 +681,14 @@ mod tests {
         let scene = masked_scene(MaskMode::Alpha);
         let mut renderer = VelloCpuRenderer::new(64, 64);
 
-        renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.reset();
+        renderer.render_scene(&scene).unwrap();
+        renderer.read_rgba8().unwrap();
         assert_eq!(renderer.mask_cache.len(), 1);
 
-        renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.reset();
+        renderer.render_scene(&scene).unwrap();
+        renderer.read_rgba8().unwrap();
         assert_eq!(renderer.mask_cache.len(), 1);
     }
 
@@ -643,13 +697,17 @@ mod tests {
         let scene = masked_scene(MaskMode::Luminance);
         let mut renderer = VelloCpuRenderer::new(64, 64);
 
-        renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.reset();
+        renderer.render_scene(&scene).unwrap();
+        renderer.read_rgba8().unwrap();
         assert_eq!(renderer.mask_cache.len(), 1);
 
         renderer.clear_cached_masks();
         assert!(renderer.mask_cache.is_empty());
 
-        renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.reset();
+        renderer.render_scene(&scene).unwrap();
+        renderer.read_rgba8().unwrap();
         assert_eq!(renderer.mask_cache.len(), 1);
     }
 
@@ -658,7 +716,9 @@ mod tests {
         let scene = masked_scene(MaskMode::Alpha);
         let mut renderer = VelloCpuRenderer::new(64, 64);
 
-        renderer.render_scene_rgba8(&scene).unwrap();
+        renderer.reset();
+        renderer.render_scene(&scene).unwrap();
+        renderer.read_rgba8().unwrap();
         assert_eq!(renderer.mask_cache.len(), 1);
 
         renderer.set_tolerance(0.25);

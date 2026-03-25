@@ -8,7 +8,8 @@
 //! At a high level, there are three ways to use it:
 //!
 //! - [`SkiaRenderer`] renders through Skia Ganesh into a GPU-backed surface.
-//! - [`SkiaCpuRenderer`] renders through Skia's raster backend into CPU memory.
+//! - [`SkiaCpuRenderState`] replays through Skia's raster backend into any raster surface.
+//! - [`SkiaCpuRenderer`] is the owned convenience wrapper for CPU raster rendering.
 //! - [`SkCanvasSink`] and [`SkPictureRecorderSink`] let you stream `imaging` commands directly into
 //!   native Skia targets instead of going through the owned renderers.
 //!
@@ -29,6 +30,11 @@
 //!
 //! [`SkiaCpuRenderer`] is the simpler choice when you just need pixels and do not need graphics API
 //! interop. It allocates a raster surface internally and returns RGBA8 output after replay.
+//!
+//! [`SkiaCpuRenderState`] is the lower-level CPU replay engine. It keeps reusable raster-side
+//! state such as path tolerance while callers provide the destination
+//! [`skia_safe::Surface`]. Use it when you want to render into caller-owned CPU memory via
+//! `wrap_pixels` or when a host application owns raster-surface allocation.
 //!
 //! [`SkiaRenderer`] is the GPU path. It owns a Ganesh context and an offscreen GPU render surface
 //! by default, but it can also be pointed at caller-owned backend textures through the backend-
@@ -54,6 +60,12 @@
 //! - you want the lowest-friction offscreen renderer
 //! - you do not need GPU interop
 //! - deterministic CPU-side rendering is more important than backend integration
+//!
+//! Use [`SkiaCpuRenderState`] when:
+//!
+//! - you want to render into a caller-owned raster surface
+//! - you want to reuse CPU-side caches across multiple wrapped surfaces
+//! - your application already manages pixel storage and surface lifetime
 //!
 //! Use [`SkiaRenderer::new`] or [`SkiaRenderer::try_new`] when:
 //!
@@ -99,8 +111,46 @@
 //!     }
 //!
 //!     let mut renderer = SkiaRenderer::new(128, 128);
-//!     let rgba = renderer.render_scene_rgba8(&scene)?;
-//!     assert_eq!(rgba.len(), 128 * 128 * 4);
+//!     renderer.reset()?;
+//!     renderer.render_scene(&scene)?;
+//!     let image = renderer.read_image()?;
+//!     assert_eq!(image.width, 128);
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Render Into Wrapped Pixels
+//!
+//! If you already own the destination pixels, wrap them in a raster surface and use
+//! [`SkiaCpuRenderState`].
+//!
+//! ```no_run
+//! use imaging::{Painter, record};
+//! use imaging_skia::SkiaCpuRenderState;
+//! use kurbo::Rect;
+//! use peniko::{Brush, Color};
+//! use skia_safe as sk;
+//!
+//! fn main() -> Result<(), imaging_skia::Error> {
+//!     let paint = Brush::Solid(Color::from_rgb8(0x16, 0xa3, 0x4a));
+//!     let mut scene = record::Scene::new();
+//!
+//!     {
+//!         let mut painter = Painter::new(&mut scene);
+//!         painter.fill_rect(Rect::new(0.0, 0.0, 128.0, 128.0), &paint);
+//!     }
+//!
+//!     let mut pixels = vec![0_u8; 128 * 128 * 4];
+//!     let info = sk::ImageInfo::new(
+//!         (128, 128),
+//!         sk::ColorType::RGBA8888,
+//!         sk::AlphaType::Premul,
+//!         None,
+//!     );
+//!     let mut surface = sk::surfaces::wrap_pixels(&info, pixels.as_mut_slice(), Some(128 * 4), None)
+//!         .expect("wrap raster pixels");
+//!     let mut state = SkiaCpuRenderState::new();
+//!     state.render_scene(&mut surface, &scene)?;
 //!     Ok(())
 //! }
 //! ```
@@ -177,8 +227,10 @@
 //!
 //!     let picture = sink.finish_picture()?;
 //!     let mut renderer = SkiaRenderer::new(128, 128);
-//!     let rgba = renderer.render_picture_rgba8(&picture)?;
-//!     assert_eq!(rgba.len(), 128 * 128 * 4);
+//!     renderer.reset()?;
+//!     renderer.render_picture(&picture)?;
+//!     let image = renderer.read_image()?;
+//!     assert_eq!(image.width, 128);
 //!     Ok(())
 //! }
 //! ```
@@ -211,9 +263,8 @@ use skia_safe as sk;
 
 use crate::font_cache::skia_font_from_glyph_run;
 use crate::ganesh::{GaneshBackend, create_surface as create_ganesh_surface};
-use std::{cell::RefCell, rc::Rc};
+use std::sync::Arc;
 
-use sinks::MaskCache;
 pub use sinks::{SkCanvasSink, SkPictureRecorderSink};
 
 /// Errors that can occur when rendering via Skia.
@@ -249,7 +300,6 @@ pub struct SkiaRenderer {
     backend: GaneshBackend,
     surface: sk::Surface,
     tolerance: f64,
-    mask_cache: Rc<RefCell<MaskCache>>,
     #[cfg(feature = "wgpu")]
     wgpu_backend_keepalive: Option<WgpuDeviceQueueKeepalive>,
     #[cfg(feature = "wgpu")]
@@ -316,7 +366,6 @@ impl SkiaRenderer {
             backend,
             surface,
             tolerance: 0.1,
-            mask_cache: Rc::new(RefCell::new(MaskCache::default())),
             #[cfg(feature = "wgpu")]
             wgpu_backend_keepalive: None,
             #[cfg(feature = "wgpu")]
@@ -329,20 +378,11 @@ impl SkiaRenderer {
     /// Lower values preserve curve fidelity more aggressively; higher values can reduce path
     /// complexity when rendering highly curved geometry.
     pub fn set_tolerance(&mut self, tolerance: f64) {
-        if self.tolerance != tolerance {
-            self.mask_cache.borrow_mut().clear();
-        }
         self.tolerance = tolerance;
     }
 
-    /// Drop any realized mask artifacts cached by the renderer.
-    ///
-    /// The cache is renderer-scoped so unchanged masked subscenes can be reused across renders.
-    /// Call this if you need to release memory aggressively or after changing assumptions that
-    /// affect mask realization outside the recorded scene itself.
-    pub fn clear_cached_masks(&mut self) {
-        self.mask_cache.borrow_mut().clear();
-    }
+    /// No-op retained for API compatibility after native Skia masking removed realized mask caches.
+    pub fn clear_cached_masks(&mut self) {}
 
     #[cfg(feature = "wgpu")]
     fn set_wgpu_backend_keepalive(&mut self, keepalive: WgpuDeviceQueueKeepalive) {
@@ -659,11 +699,39 @@ impl SkiaRenderer {
     ///
     /// Rendering methods call this internally so each frame starts from a known transform, clip,
     /// and clear state regardless of what the previous frame left behind.
-    fn reset(&mut self) {
+    pub fn reset(&mut self) -> Result<(), Error> {
+        self.backend.ensure_current()?;
         let canvas = self.surface.canvas();
         canvas.restore_to_count(1);
         canvas.reset_matrix();
         canvas.clear(sk::Color::TRANSPARENT);
+        Ok(())
+    }
+
+    fn canvas_sink(&mut self) -> SkCanvasSink<'_> {
+        let mut sink = SkCanvasSink::new(self.surface.canvas());
+        sink.set_tolerance(self.tolerance);
+        sink
+    }
+
+    fn flush(&mut self) {
+        self.backend.flush_surface(&mut self.surface);
+    }
+
+    /// Stream `imaging` commands directly into the current GPU surface.
+    ///
+    /// This is the low-level sink-oriented API for callers that want to drive Skia directly
+    /// without first building an intermediate `Scene`.
+    pub fn with_canvas_sink<R>(
+        &mut self,
+        f: impl FnOnce(&mut SkCanvasSink<'_>) -> R,
+    ) -> Result<R, Error> {
+        self.backend.ensure_current()?;
+        let mut sink = self.canvas_sink();
+        let out = f(&mut sink);
+        sink.finish()?;
+        self.flush();
+        Ok(out)
     }
 
     /// Replay an `imaging` scene into the current GPU surface.
@@ -673,13 +741,10 @@ impl SkiaRenderer {
     pub fn render_scene(&mut self, scene: &Scene) -> Result<(), Error> {
         scene.validate().map_err(Error::InvalidScene)?;
         self.backend.ensure_current()?;
-        self.reset();
-        let mut sink =
-            SkCanvasSink::new_with_mask_cache(self.surface.canvas(), Rc::clone(&self.mask_cache));
-        sink.set_tolerance(self.tolerance);
+        let mut sink = self.canvas_sink();
         replay(scene, &mut sink);
         sink.finish()?;
-        self.backend.flush_surface(&mut self.surface);
+        self.flush();
         Ok(())
     }
 
@@ -689,9 +754,8 @@ impl SkiaRenderer {
     /// same renderer and readback path as scene-based rendering.
     pub fn render_picture(&mut self, picture: &sk::Picture) -> Result<(), Error> {
         self.backend.ensure_current()?;
-        self.reset();
         self.surface.canvas().draw_picture(picture, None, None);
-        self.backend.flush_surface(&mut self.surface);
+        self.flush();
         Ok(())
     }
 
@@ -707,7 +771,7 @@ impl SkiaRenderer {
     /// This flushes pending work first so the returned image reflects the renderer's latest output.
     pub fn image_snapshot(&mut self) -> sk::Image {
         let _ = self.backend.ensure_current();
-        self.backend.flush_surface(&mut self.surface);
+        self.flush();
         self.surface.image_snapshot()
     }
 
@@ -717,33 +781,19 @@ impl SkiaRenderer {
     /// texture handle after rendering.
     pub fn backend_texture(&mut self) -> Option<sk::gpu::BackendTexture> {
         let _ = self.backend.ensure_current();
-        self.backend.flush_surface(&mut self.surface);
+        self.flush();
         sk::gpu::surfaces::get_backend_texture(
             &mut self.surface,
             sk::surface::BackendHandleAccess::FlushRead,
         )
     }
 
-    /// Render a scene and immediately read it back as unpremultiplied RGBA8 bytes.
-    ///
-    /// This is the simplest end-to-end API when the caller only needs pixel output.
-    pub fn render_scene_rgba8(&mut self, scene: &Scene) -> Result<Vec<u8>, Error> {
-        self.render_scene(scene)?;
-        self.read_rgba8()
-    }
-
-    /// Render a native Skia picture and immediately read it back as RGBA8 bytes.
-    pub fn render_picture_rgba8(&mut self, picture: &sk::Picture) -> Result<Vec<u8>, Error> {
-        self.render_picture(picture)?;
-        self.read_rgba8()
-    }
-
-    /// Read back the current GPU surface into an unpremultiplied RGBA8 buffer.
+    /// Read back the current GPU surface into an unpremultiplied RGBA8 image.
     ///
     /// Rendering methods funnel through this helper after flushing work to the active backend.
-    fn read_rgba8(&mut self) -> Result<Vec<u8>, Error> {
+    pub fn read_image(&mut self) -> Result<peniko::ImageData, Error> {
         self.backend.ensure_current()?;
-        self.backend.flush_surface(&mut self.surface);
+        self.flush();
         let info = sk::ImageInfo::new(
             (self.surface.width(), self.surface.height()),
             sk::ColorType::RGBA8888,
@@ -761,18 +811,133 @@ impl SkiaRenderer {
         if !ok {
             return Err(Error::Internal("read_pixels failed"));
         }
-        Ok(bytes)
+        Ok(peniko::ImageData {
+            data: peniko::Blob::new(Arc::new(bytes)),
+            format: ImageFormat::Rgba8,
+            width: self.surface.width() as u32,
+            height: self.surface.height() as u32,
+            alpha_type: ImageAlphaType::Alpha,
+        })
     }
 }
 
-/// CPU raster renderer that executes `imaging` commands using a Skia raster surface.
+/// Reusable CPU raster replay state for Skia-backed rendering.
+///
+/// This type keeps renderer-side state such as tolerance while callers provide the destination
+/// raster surface for each render.
+#[derive(Debug)]
+pub struct SkiaCpuRenderState {
+    tolerance: f64,
+}
+
+impl Default for SkiaCpuRenderState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SkiaCpuRenderState {
+    /// Create reusable CPU raster replay state.
+    pub fn new() -> Self {
+        Self { tolerance: 0.1 }
+    }
+
+    /// Set the geometric flattening tolerance used for path conversion.
+    pub fn set_tolerance(&mut self, tolerance: f64) {
+        self.tolerance = tolerance;
+    }
+
+    /// No-op retained for API compatibility after native Skia masking removed realized mask caches.
+    pub fn clear_cached_masks(&mut self) {}
+
+    /// Create a short-lived renderer view bound to a caller-provided raster surface.
+    pub fn bind<'a>(&'a mut self, surface: &'a mut sk::Surface) -> SkiaCpuRendererRef<'a> {
+        SkiaCpuRendererRef {
+            state: self,
+            surface,
+        }
+    }
+
+    /// Reset canvas state before starting a new frame on the provided raster surface.
+    pub fn reset(surface: &mut sk::Surface) {
+        let canvas = surface.canvas();
+        canvas.restore_to_count(1);
+        canvas.reset_matrix();
+        canvas.clear(sk::Color::TRANSPARENT);
+    }
+
+    fn canvas_sink<'a>(&'a mut self, surface: &'a mut sk::Surface) -> SkCanvasSink<'a> {
+        let mut sink = SkCanvasSink::new(surface.canvas());
+        sink.set_tolerance(self.tolerance);
+        sink
+    }
+
+    /// Stream `imaging` commands directly into the provided raster surface.
+    pub fn with_canvas_sink<R>(
+        &mut self,
+        surface: &mut sk::Surface,
+        f: impl FnOnce(&mut SkCanvasSink<'_>) -> R,
+    ) -> Result<R, Error> {
+        let mut sink = self.canvas_sink(surface);
+        let out = f(&mut sink);
+        sink.finish()?;
+        Ok(out)
+    }
+
+    /// Replay an `imaging` scene through the raster backend into the provided surface.
+    pub fn render_scene(&mut self, surface: &mut sk::Surface, scene: &Scene) -> Result<(), Error> {
+        scene.validate().map_err(Error::InvalidScene)?;
+        self.with_canvas_sink(surface, |sink| replay(scene, sink)).map(|_| ())
+    }
+
+    /// Draw a native Skia picture through the raster backend into the provided surface.
+    pub fn render_picture(
+        &mut self,
+        surface: &mut sk::Surface,
+        picture: &sk::Picture,
+    ) -> Result<(), Error> {
+        surface.canvas().draw_picture(picture, None, None);
+        Ok(())
+    }
+
+    /// Read back the current raster surface into an unpremultiplied RGBA8 image.
+    ///
+    /// This is the raster counterpart to the GPU renderer's readback helper.
+    pub fn read_image(surface: &mut sk::Surface) -> Result<peniko::ImageData, Error> {
+        let image = surface.image_snapshot();
+        let dims = image.dimensions();
+        let info = sk::ImageInfo::new(
+            (dims.width, dims.height),
+            sk::ColorType::RGBA8888,
+            sk::AlphaType::Unpremul,
+            None,
+        );
+        let mut bytes = vec![0_u8; (dims.width as usize) * (dims.height as usize) * 4];
+        let ok = image.read_pixels(
+            &info,
+            bytes.as_mut_slice(),
+            (4 * dims.width) as usize,
+            (0, 0),
+            sk::image::CachingHint::Disallow,
+        );
+        if !ok {
+            return Err(Error::Internal("read_pixels failed"));
+        }
+        Ok(peniko::ImageData {
+            data: peniko::Blob::new(Arc::new(bytes)),
+            format: ImageFormat::Rgba8,
+            width: dims.width as u32,
+            height: dims.height as u32,
+            alpha_type: ImageAlphaType::Alpha,
+        })
+    }
+}
+
+/// Owned CPU raster renderer that allocates and retains its own raster surface.
 #[derive(Debug)]
 pub struct SkiaCpuRenderer {
+    state: SkiaCpuRenderState,
     surface: sk::Surface,
-    width: i32,
-    height: i32,
-    tolerance: f64,
-    mask_cache: Rc<RefCell<MaskCache>>,
 }
 
 impl SkiaCpuRenderer {
@@ -783,10 +948,6 @@ impl SkiaCpuRenderer {
     pub fn new(width: u16, height: u16) -> Self {
         let width = i32::from(width);
         let height = i32::from(height);
-        // Use an explicit RGBA8888 premultiplied raster surface. Many blend modes are defined in
-        // premultiplied space, and it also matches Skia's typical raster backend behavior.
-        //
-        // Note: we still export unpremultiplied RGBA8 from `read_rgba8()`.
         let info = sk::ImageInfo::new(
             (width, height),
             sk::ColorType::RGBA8888,
@@ -796,84 +957,95 @@ impl SkiaCpuRenderer {
         let surface = sk::surfaces::raster(&info, None, None)
             .expect("create skia raster RGBA8888/premul surface");
         Self {
+            state: SkiaCpuRenderState::new(),
             surface,
-            width,
-            height,
-            tolerance: 0.1,
-            mask_cache: Rc::new(RefCell::new(MaskCache::default())),
         }
     }
 
     /// Set the geometric flattening tolerance used for path conversion.
     pub fn set_tolerance(&mut self, tolerance: f64) {
-        if self.tolerance != tolerance {
-            self.mask_cache.borrow_mut().clear();
-        }
-        self.tolerance = tolerance;
+        self.state.set_tolerance(tolerance);
     }
 
     /// Drop any realized mask artifacts cached by the renderer.
-    ///
-    /// The cache is renderer-scoped so unchanged masked subscenes can be reused across renders.
-    /// Call this if you need to release memory aggressively or after changing assumptions that
-    /// affect mask realization outside the recorded scene itself.
     pub fn clear_cached_masks(&mut self) {
-        self.mask_cache.borrow_mut().clear();
+        self.state.clear_cached_masks();
     }
 
-    /// Reset canvas state before rendering a new frame into the raster surface.
-    ///
-    /// Rendering methods call this internally so each frame starts from a known transform, clip,
-    /// and clear state.
-    fn reset(&mut self) {
-        let canvas = self.surface.canvas();
-        canvas.restore_to_count(1);
-        canvas.reset_matrix();
-        canvas.clear(sk::Color::TRANSPARENT);
+    /// Borrow the live raster `skia_safe::Surface`.
+    pub fn surface(&mut self) -> &mut sk::Surface {
+        &mut self.surface
     }
 
-    /// Replay an `imaging` scene through the raster backend and read back RGBA8 bytes.
-    pub fn render_scene_rgba8(&mut self, scene: &Scene) -> Result<Vec<u8>, Error> {
-        scene.validate().map_err(Error::InvalidScene)?;
-        self.reset();
-        let mut sink =
-            SkCanvasSink::new_with_mask_cache(self.surface.canvas(), Rc::clone(&self.mask_cache));
-        sink.set_tolerance(self.tolerance);
-        replay(scene, &mut sink);
-        sink.finish()?;
-        self.read_rgba8()
+    /// Reset canvas state before starting a new frame on the owned surface.
+    pub fn reset(&mut self) {
+        SkiaCpuRenderState::reset(&mut self.surface);
     }
 
-    /// Draw a native Skia picture through the raster backend and read back RGBA8 bytes.
-    pub fn render_picture_rgba8(&mut self, picture: &sk::Picture) -> Result<Vec<u8>, Error> {
-        self.reset();
-        self.surface.canvas().draw_picture(picture, None, None);
-        self.read_rgba8()
+    /// Stream `imaging` commands directly into the owned raster surface.
+    pub fn with_canvas_sink<R>(
+        &mut self,
+        f: impl FnOnce(&mut SkCanvasSink<'_>) -> R,
+    ) -> Result<R, Error> {
+        self.state.with_canvas_sink(&mut self.surface, f)
     }
 
-    /// Read back the current raster surface into an unpremultiplied RGBA8 buffer.
-    ///
-    /// This is the raster counterpart to the GPU renderer's readback helper.
-    fn read_rgba8(&mut self) -> Result<Vec<u8>, Error> {
-        let image = self.surface.image_snapshot();
-        let info = sk::ImageInfo::new(
-            (self.width, self.height),
-            sk::ColorType::RGBA8888,
-            sk::AlphaType::Unpremul,
-            None,
-        );
-        let mut bytes = vec![0_u8; (self.width as usize) * (self.height as usize) * 4];
-        let ok = image.read_pixels(
-            &info,
-            bytes.as_mut_slice(),
-            (4 * self.width) as usize,
-            (0, 0),
-            sk::image::CachingHint::Disallow,
-        );
-        if !ok {
-            return Err(Error::Internal("read_pixels failed"));
-        }
-        Ok(bytes)
+    /// Replay an `imaging` scene through the owned raster backend.
+    pub fn render_scene(&mut self, scene: &Scene) -> Result<(), Error> {
+        self.state.render_scene(&mut self.surface, scene)
+    }
+
+    /// Draw a native Skia picture through the owned raster backend.
+    pub fn render_picture(&mut self, picture: &sk::Picture) -> Result<(), Error> {
+        self.state.render_picture(&mut self.surface, picture)
+    }
+
+    /// Read back the current owned raster surface into an unpremultiplied RGBA8 image.
+    pub fn read_image(&mut self) -> Result<peniko::ImageData, Error> {
+        SkiaCpuRenderState::read_image(&mut self.surface)
+    }
+
+}
+
+/// Borrowed CPU raster renderer view that binds reusable CPU state to a caller-owned surface.
+#[derive(Debug)]
+pub struct SkiaCpuRendererRef<'a> {
+    state: &'a mut SkiaCpuRenderState,
+    surface: &'a mut sk::Surface,
+}
+
+impl SkiaCpuRendererRef<'_> {
+    /// Reset canvas state before starting a new frame on the bound raster surface.
+    pub fn reset(&mut self) {
+        SkiaCpuRenderState::reset(self.surface);
+    }
+
+    /// Stream `imaging` commands directly into the bound raster surface.
+    pub fn with_canvas_sink<R>(
+        &mut self,
+        f: impl FnOnce(&mut SkCanvasSink<'_>) -> R,
+    ) -> Result<R, Error> {
+        self.state.with_canvas_sink(self.surface, f)
+    }
+
+    /// Replay an `imaging` scene through the bound raster surface.
+    pub fn render_scene(&mut self, scene: &Scene) -> Result<(), Error> {
+        self.state.render_scene(self.surface, scene)
+    }
+
+    /// Draw a native Skia picture through the bound raster surface.
+    pub fn render_picture(&mut self, picture: &sk::Picture) -> Result<(), Error> {
+        self.state.render_picture(self.surface, picture)
+    }
+
+    /// Read back the current bound raster surface into an unpremultiplied RGBA8 image.
+    pub fn read_image(&mut self) -> Result<peniko::ImageData, Error> {
+        SkiaCpuRenderState::read_image(self.surface)
+    }
+
+    /// Borrow the currently bound raster `skia_safe::Surface`.
+    pub fn surface(&mut self) -> &mut sk::Surface {
+        self.surface
     }
 }
 
@@ -1412,7 +1584,7 @@ mod tests {
     }
 
     #[test]
-    fn render_picture_rgba8_reads_native_picture() {
+    fn read_image_reads_native_picture() {
         let mut sink = SkPictureRecorderSink::new(Rect::new(0.0, 0.0, 32.0, 32.0));
         let paint = Brush::Solid(Color::from_rgb8(0x22, 0x66, 0xaa));
         {
@@ -1422,49 +1594,57 @@ mod tests {
 
         let picture = sink.finish_picture().unwrap();
         let mut renderer = SkiaRenderer::new(32, 32);
-        let rgba = renderer.render_picture_rgba8(&picture).unwrap();
+        renderer.reset().unwrap();
+        renderer.render_picture(&picture).unwrap();
+        let image = renderer.read_image().unwrap();
 
-        assert_eq!(rgba.len(), 32 * 32 * 4);
-        assert_eq!(&rgba[..4], &[0x22, 0x66, 0xaa, 0xff]);
+        assert_eq!(image.width, 32);
+        assert_eq!(image.height, 32);
+        assert_eq!(&image.data.as_ref()[..4], &[0x22, 0x66, 0xaa, 0xff]);
     }
 
     #[test]
-    fn render_scene_reuses_cached_masks_for_identical_scenes() {
+    fn render_scene_replays_masked_content_without_cached_mask_artifacts() {
         let scene = masked_scene(MaskMode::Alpha);
         let mut renderer = SkiaRenderer::new(64, 64);
 
-        renderer.render_scene_rgba8(&scene).unwrap();
-        assert_eq!(renderer.mask_cache.borrow().len(), 1);
+        renderer.reset().unwrap();
+        renderer.render_scene(&scene).unwrap();
+        renderer.read_image().unwrap();
 
-        renderer.render_scene_rgba8(&scene).unwrap();
-        assert_eq!(renderer.mask_cache.borrow().len(), 1);
+        renderer.render_scene(&scene).unwrap();
+        renderer.read_image().unwrap();
     }
 
     #[test]
-    fn clear_cached_masks_drops_realized_masks() {
+    fn clear_cached_masks_is_a_no_op_without_realized_masks() {
         let scene = masked_scene(MaskMode::Luminance);
         let mut renderer = SkiaRenderer::new(64, 64);
 
-        renderer.render_scene_rgba8(&scene).unwrap();
-        assert_eq!(renderer.mask_cache.borrow().len(), 1);
+        renderer.reset().unwrap();
+        renderer.render_scene(&scene).unwrap();
+        renderer.read_image().unwrap();
 
         renderer.clear_cached_masks();
-        assert_eq!(renderer.mask_cache.borrow().len(), 0);
 
-        renderer.render_scene_rgba8(&scene).unwrap();
-        assert_eq!(renderer.mask_cache.borrow().len(), 1);
+        renderer.reset().unwrap();
+        renderer.render_scene(&scene).unwrap();
+        renderer.read_image().unwrap();
     }
 
     #[test]
-    fn changing_tolerance_clears_cached_masks() {
+    fn changing_tolerance_keeps_masked_rendering_working() {
         let scene = masked_scene(MaskMode::Alpha);
         let mut renderer = SkiaRenderer::new(64, 64);
 
-        renderer.render_scene_rgba8(&scene).unwrap();
-        assert_eq!(renderer.mask_cache.borrow().len(), 1);
+        renderer.reset().unwrap();
+        renderer.render_scene(&scene).unwrap();
+        renderer.read_image().unwrap();
 
         renderer.set_tolerance(0.25);
-        assert_eq!(renderer.mask_cache.borrow().len(), 0);
+        renderer.reset().unwrap();
+        renderer.render_scene(&scene).unwrap();
+        renderer.read_image().unwrap();
     }
 
     #[cfg(feature = "wgpu")]
