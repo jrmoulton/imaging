@@ -13,8 +13,8 @@ use peniko::{BrushRef, Fill, Style};
 use crate::{
     BlurredRoundedRect, Composite, Filter, MaskMode, NormalizedCoord,
     record::{
-        AppliedMask, Clip, ClipId, Command, Draw, DrawId, Geometry, Glyph, GlyphRun, Group,
-        GroupId, Mask, MaskId, Scene,
+        AppliedMask, Clip, Draw, Geometry, Glyph, GlyphRun, Group, Mask, MaskId, Retained,
+        RetainedCachePolicy, RetainedDraw, RetainedMask, Scene,
     },
 };
 
@@ -320,28 +320,79 @@ impl<'a> Default for GroupRef<'a> {
     }
 }
 
+/// Borrowed retained subscene definition.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RetainedRef<'a> {
+    pub(crate) id: u64,
+    /// Scene contents of this retained subscene.
+    pub scene: &'a Scene,
+    /// Optional explicit bounds for this retained subscene in local coordinates.
+    pub bounds: Option<Rect>,
+    /// Cache policy hint for backend-native retained acceleration.
+    pub cache_policy: RetainedCachePolicy,
+}
+
+impl<'a> RetainedRef<'a> {
+    /// Create a borrowed retained subscene definition.
+    #[must_use]
+    pub fn new(scene: &'a Scene) -> Self {
+        Self {
+            id: 0,
+            scene,
+            bounds: None,
+            cache_policy: RetainedCachePolicy::default(),
+        }
+    }
+
+    /// Convert a borrowed retained definition into an owned [`Retained`].
+    #[must_use]
+    pub fn to_owned(self) -> Retained {
+        if self.id != 0 {
+            Retained {
+                id: self.id,
+                scene: self.scene.clone(),
+                bounds: self.bounds,
+                cache_policy: self.cache_policy,
+            }
+        } else {
+            Retained::new(self.scene.clone())
+                .with_optional_bounds(self.bounds)
+                .with_cache_policy(self.cache_policy)
+        }
+    }
+
+    /// Stable identity for backend-side caches attached to this retained scene.
+    #[must_use]
+    pub fn stable_id(&self) -> u64 {
+        self.id
+    }
+}
+
 /// Borrowed retained mask definition.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MaskRef<'a> {
     /// How this mask scene modulates masked content.
     pub mode: MaskMode,
-    /// Scene that produces the mask values.
-    pub scene: &'a Scene,
+    /// Reusable retained subscene that produces the mask values.
+    pub retained: RetainedRef<'a>,
 }
 
 impl<'a> MaskRef<'a> {
     /// Create a borrowed mask definition.
     #[must_use]
     pub fn new(mode: MaskMode, scene: &'a Scene) -> Self {
-        Self { mode, scene }
+        Self {
+            mode,
+            retained: RetainedRef::new(scene),
+        }
     }
 
-    /// Convert a borrowed mask definition into an owned [`Mask`].
+    /// Convert a borrowed mask definition into an owned [`RetainedMask`].
     #[must_use]
-    pub fn to_owned(self) -> Mask {
-        Mask {
+    pub fn to_owned(self) -> RetainedMask {
+        RetainedMask {
             mode: self.mode,
-            scene: self.scene.clone(),
+            retained: self.retained.to_owned(),
         }
     }
 }
@@ -380,6 +431,65 @@ impl<'a> AppliedMaskRef<'a> {
             mask: define_mask(self.mask),
             transform: self.transform,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn prepend_transform(self, prefix: Affine) -> Self {
+        Self {
+            transform: prefix * self.transform,
+            ..self
+        }
+    }
+}
+
+/// Borrowed retained-subscene draw payload.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RetainedDrawRef<'a> {
+    /// Referenced retained subscene definition.
+    pub retained: RetainedRef<'a>,
+    /// Transform applied when drawing the retained subscene.
+    pub transform: Affine,
+    /// Per-draw compositing.
+    pub composite: Composite,
+}
+
+impl<'a> RetainedDrawRef<'a> {
+    /// Create a retained-subscene draw with default state.
+    ///
+    /// Defaults:
+    /// - transform: [`Affine::IDENTITY`]
+    /// - compositing: [`Composite::default()`]
+    #[must_use]
+    pub fn new(retained: RetainedRef<'a>) -> Self {
+        Self {
+            retained,
+            transform: Affine::IDENTITY,
+            composite: Composite::default(),
+        }
+    }
+
+    /// Set the draw transform.
+    #[must_use]
+    pub fn transform(mut self, transform: Affine) -> Self {
+        self.transform = transform;
+        self
+    }
+
+    /// Set the per-draw compositing state.
+    #[must_use]
+    pub fn composite(mut self, composite: Composite) -> Self {
+        self.composite = composite;
+        self
+    }
+
+    /// Convert a borrowed retained draw into an owned [`Draw`].
+    #[must_use]
+    pub fn to_owned(self, define_retained: &mut impl FnMut(RetainedRef<'_>) -> crate::record::RetainedId) -> Draw {
+        Draw::Retained(RetainedDraw {
+            retained: define_retained(self.retained),
+            transform: self.transform,
+            composite: self.composite,
+        })
     }
 
     #[must_use]
@@ -678,6 +788,8 @@ pub trait PaintSink {
     fn push_group(&mut self, group: GroupRef<'_>);
     /// Pop the most recently pushed isolated group.
     fn pop_group(&mut self);
+    /// Emit a retained-subscene draw.
+    fn retained(&mut self, draw: RetainedDrawRef<'_>);
     /// Emit a fill draw.
     fn fill(&mut self, draw: FillRef<'_>);
     /// Emit a stroke draw.
@@ -736,20 +848,47 @@ impl Group {
             mask: self
                 .mask
                 .as_ref()
-                .map(|mask| mask.as_ref(scene.mask(mask.mask))),
+                .map(|mask| {
+                    let stored_mask = scene.mask(mask.mask);
+                    mask.as_ref(stored_mask, scene.retained(stored_mask.retained))
+                }),
             filters: &self.filters,
             composite: self.composite,
         }
     }
 }
 
-impl Mask {
-    /// Borrow this mask as a [`MaskRef`].
+impl Retained {
+    /// Borrow this retained subscene as a [`RetainedRef`].
+    #[must_use]
+    pub fn as_ref(&self) -> RetainedRef<'_> {
+        RetainedRef {
+            id: self.id,
+            scene: &self.scene,
+            bounds: self.bounds,
+            cache_policy: self.cache_policy,
+        }
+    }
+}
+
+impl RetainedMask {
+    /// Borrow this owned mask definition as a [`MaskRef`].
     #[must_use]
     pub fn as_ref(&self) -> MaskRef<'_> {
         MaskRef {
             mode: self.mode,
-            scene: &self.scene,
+            retained: self.retained.as_ref(),
+        }
+    }
+}
+
+impl Mask {
+    /// Borrow this stored mask as a [`MaskRef`].
+    #[must_use]
+    pub fn as_ref_with<'a>(&self, retained: &'a Retained) -> MaskRef<'a> {
+        MaskRef {
+            mode: self.mode,
+            retained: retained.as_ref(),
         }
     }
 }
@@ -757,10 +896,22 @@ impl Mask {
 impl AppliedMask {
     /// Borrow this mask use as an [`AppliedMaskRef`].
     #[must_use]
-    pub fn as_ref<'a>(&self, mask: &'a Mask) -> AppliedMaskRef<'a> {
+    pub fn as_ref<'a>(&self, mask: &'a Mask, retained: &'a Retained) -> AppliedMaskRef<'a> {
         AppliedMaskRef {
-            mask: mask.as_ref(),
+            mask: mask.as_ref_with(retained),
             transform: self.transform,
+        }
+    }
+}
+
+impl RetainedDraw {
+    /// Borrow this retained draw as a [`RetainedDrawRef`].
+    #[must_use]
+    pub fn as_ref<'a>(&self, retained: &'a Retained) -> RetainedDrawRef<'a> {
+        RetainedDrawRef {
+            retained: retained.as_ref(),
+            transform: self.transform,
+            composite: self.composite,
         }
     }
 }
@@ -788,6 +939,7 @@ impl Draw {
     #[must_use]
     pub fn as_ref(&self) -> DrawRef<'_> {
         match self {
+            Self::Retained(_) => unreachable!("retained draws require retained-scene context"),
             Self::Fill {
                 transform,
                 fill_rule,
@@ -824,9 +976,16 @@ impl Draw {
     }
 }
 
-struct TransformingSink<'a, S: ?Sized> {
+pub(crate) struct TransformingSink<'a, S: ?Sized> {
     inner: &'a mut S,
     transform: Affine,
+}
+
+impl<'a, S: ?Sized> TransformingSink<'a, S> {
+    #[inline]
+    pub(crate) fn new(inner: &'a mut S, transform: Affine) -> Self {
+        Self { inner, transform }
+    }
 }
 
 impl<S> PaintSink for TransformingSink<'_, S>
@@ -850,6 +1009,10 @@ where
         self.inner.pop_group();
     }
 
+    fn retained(&mut self, draw: RetainedDrawRef<'_>) {
+        self.inner.retained(draw.prepend_transform(self.transform));
+    }
+
     fn fill(&mut self, draw: FillRef<'_>) {
         self.inner.fill(draw.prepend_transform(self.transform));
     }
@@ -866,68 +1029,6 @@ where
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect) {
         self.inner
             .blurred_rounded_rect(draw.prepend_transform(self.transform));
-    }
-}
-
-fn replay_clip<S>(scene: &Scene, id: ClipId, sink: &mut S)
-where
-    S: PaintSink + ?Sized,
-{
-    sink.push_clip(scene.clip(id).as_ref());
-}
-
-fn replay_group<S>(scene: &Scene, id: GroupId, sink: &mut S)
-where
-    S: PaintSink + ?Sized,
-{
-    sink.push_group(scene.group(id).as_ref_with(scene));
-}
-
-fn replay_draw<S>(scene: &Scene, id: DrawId, sink: &mut S)
-where
-    S: PaintSink + ?Sized,
-{
-    match scene.draw_op(id) {
-        Draw::GlyphRun(glyph_run) => {
-            let mut glyphs = glyph_run.glyphs.iter().copied();
-            sink.glyph_run(glyph_run.as_ref(), &mut glyphs);
-        }
-        draw => match draw.as_ref() {
-            DrawRef::Fill(draw) => sink.fill(draw),
-            DrawRef::Stroke(draw) => sink.stroke(draw),
-            DrawRef::BlurredRoundedRect(draw) => sink.blurred_rounded_rect(draw),
-            DrawRef::GlyphRun(_) => {
-                unreachable!("glyph runs are handled using the owned glyph slice")
-            }
-        },
-    }
-}
-
-/// Replay a recorded [`crate::record::Scene`] into a [`PaintSink`].
-pub(crate) fn replay<S>(scene: &Scene, sink: &mut S)
-where
-    S: PaintSink + ?Sized,
-{
-    replay_transformed(scene, sink, Affine::IDENTITY);
-}
-
-/// Replay a recorded [`crate::record::Scene`] into a [`PaintSink`] with an extra transform.
-pub(crate) fn replay_transformed<S>(scene: &Scene, sink: &mut S, transform: Affine)
-where
-    S: PaintSink + ?Sized,
-{
-    let mut sink = TransformingSink {
-        inner: sink,
-        transform,
-    };
-    for cmd in scene.commands() {
-        match *cmd {
-            Command::PushClip(id) => replay_clip(scene, id, &mut sink),
-            Command::PopClip => sink.pop_clip(),
-            Command::PushGroup(id) => replay_group(scene, id, &mut sink),
-            Command::PopGroup => sink.pop_group(),
-            Command::Draw(id) => replay_draw(scene, id, &mut sink),
-        }
     }
 }
 
@@ -1112,7 +1213,7 @@ mod tests {
 
         let transform = Affine::translate((100.0, 200.0));
         let mut replayed = Scene::new();
-        replay_transformed(&source, &mut replayed, transform);
+        crate::record::replay_transformed(&source, &mut replayed, transform);
 
         assert_eq!(replayed.commands(), source.commands());
         assert_eq!(

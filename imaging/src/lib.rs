@@ -18,7 +18,8 @@
 //!
 //! ```rust
 //! use imaging::{
-//!     BlurredRoundedRect, ClipRef, FillRef, GlyphRunRef, GroupRef, PaintSink, Painter, StrokeRef,
+//!     BlurredRoundedRect, ClipRef, FillRef, GlyphRunRef, GroupRef, PaintSink, Painter, RetainedDrawRef,
+//!     StrokeRef,
 //! };
 //! use kurbo::Rect;
 //! use peniko::Color;
@@ -39,6 +40,8 @@
 //!     fn push_group(&mut self, _group: GroupRef<'_>) {}
 //!
 //!     fn pop_group(&mut self) {}
+//!
+//!     fn retained(&mut self, _draw: RetainedDrawRef<'_>) {}
 //!
 //!     fn fill(&mut self, _draw: FillRef<'_>) {
 //!         self.fills += 1;
@@ -114,15 +117,21 @@ pub mod validation;
 
 pub use paint::{
     AppliedMaskRef, ClipRef, DrawRef, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskRef,
-    PaintSink, StrokeRef,
+    PaintSink, RetainedDrawRef, RetainedRef, StrokeRef,
 };
-pub use painter::{FillBuilder, GlyphRunBuilder, PaintShape, Painter, StrokeBuilder};
+pub use painter::{
+    FillBuilder, GlyphRunBuilder, PaintShape, Painter, StrokeBuilder, record_mask, record_retained,
+};
+pub use record::{
+    ReplaySource, Retained, RetainedCachePolicy, RetainedEvictionPolicy, RetainedMask,
+    RetainedTransformPolicy,
+};
 
 /// Normalized variable-font coordinate value.
 pub type NormalizedCoord = i16;
 
 /// How a mask scene modulates a masked content scene.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MaskMode {
     /// Use the mask scene's alpha channel.
     Alpha,

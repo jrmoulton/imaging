@@ -5,7 +5,8 @@ use super::Error;
 use crate::{VelloHybridRenderer, image_registry::HybridImageUploadSession};
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
-    StrokeRef,
+    RetainedDrawRef, StrokeRef,
+    record::replay_transformed,
 };
 use kurbo::{Affine, Shape as _};
 use peniko::{Brush, BrushRef, ImageBrush, Style};
@@ -277,6 +278,22 @@ impl PaintSink for VelloHybridSceneSink<'_> {
         }
         self.scene.pop_layer();
         self.group_depth -= 1;
+    }
+
+    fn retained(&mut self, draw: RetainedDrawRef<'_>) {
+        if self.error.is_some() {
+            return;
+        }
+        if draw.composite != Composite::default() {
+            self.push_group(GroupRef::new().with_composite(draw.composite));
+            if self.error.is_some() {
+                return;
+            }
+        }
+        replay_transformed(draw.retained.scene, self, draw.transform);
+        if draw.composite != Composite::default() {
+            self.pop_group();
+        }
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {

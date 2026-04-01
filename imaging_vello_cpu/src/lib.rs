@@ -71,7 +71,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GeometryRef, GlyphRunRef, GroupRef,
-    MaskMode, PaintSink, StrokeRef,
+    MaskMode, PaintSink, RetainedDrawRef, StrokeRef,
     record::{Scene, ValidateError, replay, replay_transformed},
 };
 use kurbo::{Affine, Rect, Shape as _};
@@ -535,7 +535,9 @@ impl PaintSink for VelloCpuRenderer {
         let opacity: Option<f32> = Some(group.composite.alpha);
         let mask = group
             .mask
-            .and_then(|mask| self.render_mask(mask.mask.scene, mask.mask.mode, mask.transform));
+            .and_then(|mask| {
+                self.render_mask(mask.mask.retained.scene, mask.mask.mode, mask.transform)
+            });
         let filter = self.filters_to_vello(group.filters);
         self.ctx
             .push_layer(clip_path.as_ref(), blend, opacity, mask, filter);
@@ -552,6 +554,22 @@ impl PaintSink for VelloCpuRenderer {
         }
         self.ctx.pop_layer();
         self.group_depth -= 1;
+    }
+
+    fn retained(&mut self, draw: RetainedDrawRef<'_>) {
+        if self.error.is_some() {
+            return;
+        }
+        if draw.composite != Composite::default() {
+            self.push_group(GroupRef::new().with_composite(draw.composite));
+            if self.error.is_some() {
+                return;
+            }
+        }
+        replay_transformed(draw.retained.scene, self, draw.transform);
+        if draw.composite != Composite::default() {
+            self.pop_group();
+        }
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {
@@ -665,7 +683,10 @@ mod tests {
         }
 
         let mut scene = Scene::new();
-        let mask_id = scene.define_mask(imaging::record::Mask::new(mode, mask));
+        let mask_id = scene.define_mask(imaging::record::RetainedMask::new(
+            mode,
+            imaging::record::Retained::new(mask),
+        ));
         let group = imaging::record::Group {
             mask: Some(imaging::record::AppliedMask::new(mask_id)),
             ..imaging::record::Group::default()

@@ -558,7 +558,7 @@ where
 
     fn validate_group_mask(&mut self, mask: &AppliedMaskRef<'_>) -> bool {
         let mut ok = self.validate_affine("Group::mask::transform", &mask.transform);
-        ok &= self.validate_recorded_scene_stream(mask.mask.scene);
+        ok &= self.validate_recorded_scene_stream(mask.mask.retained.scene);
         ok
     }
 }
@@ -626,6 +626,21 @@ where
         }
         self.group_depth -= 1;
         self.inner.pop_group();
+    }
+
+    fn retained(&mut self, draw: crate::RetainedDrawRef<'_>) {
+        if self.aborted {
+            return;
+        }
+
+        let ok = self.validate_affine("Draw::Retained::transform", &draw.transform)
+            && self.validate_composite(&draw.composite)
+            && self.validate_recorded_scene_stream(draw.retained.scene);
+        if !ok {
+            return;
+        }
+
+        self.inner.retained(draw);
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {

@@ -260,11 +260,13 @@ use kurbo::{Affine, Shape as _};
 use peniko::color::{ColorSpaceTag, HueDirection, Srgb};
 use peniko::{BrushRef, ImageAlphaType, ImageFormat, ImageQuality, InterpolationAlphaSpace};
 use skia_safe as sk;
+use std::{cell::RefCell, rc::Rc};
 
 use crate::font_cache::skia_font_from_glyph_run;
 use crate::ganesh::{GaneshBackend, create_surface as create_ganesh_surface};
 use std::sync::Arc;
 
+use sinks::{MaskImageCache, RetainedImageCache};
 pub use sinks::{SkCanvasSink, SkPictureRecorderSink};
 
 /// Errors that can occur when rendering via Skia.
@@ -300,6 +302,8 @@ pub struct SkiaRenderer {
     backend: GaneshBackend,
     surface: sk::Surface,
     tolerance: f64,
+    mask_cache: Rc<RefCell<MaskImageCache>>,
+    retained_image_cache: Rc<RefCell<RetainedImageCache>>,
     #[cfg(feature = "wgpu")]
     wgpu_backend_keepalive: Option<WgpuDeviceQueueKeepalive>,
     #[cfg(feature = "wgpu")]
@@ -366,6 +370,8 @@ impl SkiaRenderer {
             backend,
             surface,
             tolerance: 0.1,
+            mask_cache: Rc::new(RefCell::new(MaskImageCache::default())),
+            retained_image_cache: Rc::new(RefCell::new(RetainedImageCache::default())),
             #[cfg(feature = "wgpu")]
             wgpu_backend_keepalive: None,
             #[cfg(feature = "wgpu")]
@@ -379,10 +385,22 @@ impl SkiaRenderer {
     /// complexity when rendering highly curved geometry.
     pub fn set_tolerance(&mut self, tolerance: f64) {
         self.tolerance = tolerance;
+        self.clear_cached_masks();
     }
 
-    /// No-op retained for API compatibility after native Skia masking removed realized mask caches.
-    pub fn clear_cached_masks(&mut self) {}
+    /// Drop any realized native mask images cached by the renderer.
+    pub fn clear_cached_masks(&mut self) {
+        self.mask_cache.borrow_mut().clear();
+        self.retained_image_cache.borrow_mut().clear();
+    }
+
+    fn begin_frame(&mut self) {
+        self.retained_image_cache.borrow_mut().flip_mark();
+    }
+
+    fn end_frame(&mut self) {
+        self.retained_image_cache.borrow_mut().evict_unmarked();
+    }
 
     #[cfg(feature = "wgpu")]
     fn set_wgpu_backend_keepalive(&mut self, keepalive: WgpuDeviceQueueKeepalive) {
@@ -709,7 +727,11 @@ impl SkiaRenderer {
     }
 
     fn canvas_sink(&mut self) -> SkCanvasSink<'_> {
-        let mut sink = SkCanvasSink::new(self.surface.canvas());
+        let mut sink = SkCanvasSink::new_with_mask_cache(
+            self.surface.canvas(),
+            Rc::clone(&self.mask_cache),
+            Rc::clone(&self.retained_image_cache),
+        );
         sink.set_tolerance(self.tolerance);
         sink
     }
@@ -727,9 +749,12 @@ impl SkiaRenderer {
         f: impl FnOnce(&mut SkCanvasSink<'_>) -> R,
     ) -> Result<R, Error> {
         self.backend.ensure_current()?;
+        self.begin_frame();
         let mut sink = self.canvas_sink();
         let out = f(&mut sink);
-        sink.finish()?;
+        let finish_result = sink.finish();
+        self.end_frame();
+        finish_result?;
         self.flush();
         Ok(out)
     }
@@ -741,9 +766,12 @@ impl SkiaRenderer {
     pub fn render_scene(&mut self, scene: &Scene) -> Result<(), Error> {
         scene.validate().map_err(Error::InvalidScene)?;
         self.backend.ensure_current()?;
+        self.begin_frame();
         let mut sink = self.canvas_sink();
         replay(scene, &mut sink);
-        sink.finish()?;
+        let finish_result = sink.finish();
+        self.end_frame();
+        finish_result?;
         self.flush();
         Ok(())
     }
@@ -828,6 +856,8 @@ impl SkiaRenderer {
 #[derive(Debug)]
 pub struct SkiaCpuRenderState {
     tolerance: f64,
+    mask_cache: Rc<RefCell<MaskImageCache>>,
+    retained_image_cache: Rc<RefCell<RetainedImageCache>>,
 }
 
 impl Default for SkiaCpuRenderState {
@@ -839,16 +869,32 @@ impl Default for SkiaCpuRenderState {
 impl SkiaCpuRenderState {
     /// Create reusable CPU raster replay state.
     pub fn new() -> Self {
-        Self { tolerance: 0.1 }
+        Self {
+            tolerance: 0.1,
+            mask_cache: Rc::new(RefCell::new(MaskImageCache::default())),
+            retained_image_cache: Rc::new(RefCell::new(RetainedImageCache::default())),
+        }
     }
 
     /// Set the geometric flattening tolerance used for path conversion.
     pub fn set_tolerance(&mut self, tolerance: f64) {
         self.tolerance = tolerance;
+        self.clear_cached_masks();
     }
 
-    /// No-op retained for API compatibility after native Skia masking removed realized mask caches.
-    pub fn clear_cached_masks(&mut self) {}
+    /// Drop any realized native mask images cached by the renderer state.
+    pub fn clear_cached_masks(&mut self) {
+        self.mask_cache.borrow_mut().clear();
+        self.retained_image_cache.borrow_mut().clear();
+    }
+
+    fn begin_frame(&mut self) {
+        self.retained_image_cache.borrow_mut().flip_mark();
+    }
+
+    fn end_frame(&mut self) {
+        self.retained_image_cache.borrow_mut().evict_unmarked();
+    }
 
     /// Create a short-lived renderer view bound to a caller-provided raster surface.
     pub fn bind<'a>(&'a mut self, surface: &'a mut sk::Surface) -> SkiaCpuRendererRef<'a> {
@@ -867,7 +913,11 @@ impl SkiaCpuRenderState {
     }
 
     fn canvas_sink<'a>(&'a mut self, surface: &'a mut sk::Surface) -> SkCanvasSink<'a> {
-        let mut sink = SkCanvasSink::new(surface.canvas());
+        let mut sink = SkCanvasSink::new_with_mask_cache(
+            surface.canvas(),
+            Rc::clone(&self.mask_cache),
+            Rc::clone(&self.retained_image_cache),
+        );
         sink.set_tolerance(self.tolerance);
         sink
     }
@@ -878,16 +928,20 @@ impl SkiaCpuRenderState {
         surface: &mut sk::Surface,
         f: impl FnOnce(&mut SkCanvasSink<'_>) -> R,
     ) -> Result<R, Error> {
+        self.begin_frame();
         let mut sink = self.canvas_sink(surface);
         let out = f(&mut sink);
-        sink.finish()?;
+        let finish_result = sink.finish();
+        self.end_frame();
+        finish_result?;
         Ok(out)
     }
 
     /// Replay an `imaging` scene through the raster backend into the provided surface.
     pub fn render_scene(&mut self, surface: &mut sk::Surface, scene: &Scene) -> Result<(), Error> {
         scene.validate().map_err(Error::InvalidScene)?;
-        self.with_canvas_sink(surface, |sink| replay(scene, sink)).map(|_| ())
+        self.with_canvas_sink(surface, |sink| replay(scene, sink))
+            .map(|_| ())
     }
 
     /// Draw a native Skia picture through the raster backend into the provided surface.
@@ -1004,7 +1058,6 @@ impl SkiaCpuRenderer {
     pub fn read_image(&mut self) -> Result<peniko::ImageData, Error> {
         SkiaCpuRenderState::read_image(&mut self.surface)
     }
-
 }
 
 /// Borrowed CPU raster renderer view that binds reusable CPU state to a caller-owned surface.
@@ -1617,7 +1670,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_cached_masks_is_a_no_op_without_realized_masks() {
+    fn clear_cached_masks_clears_realized_mask_cache() {
         let scene = masked_scene(MaskMode::Luminance);
         let mut renderer = SkiaRenderer::new(64, 64);
 

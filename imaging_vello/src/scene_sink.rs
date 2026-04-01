@@ -5,8 +5,8 @@ use super::Error;
 use crate::vello::{self, Glyph as VelloGlyph};
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskMode,
-    PaintSink, StrokeRef,
-    record::{Scene, replay_transformed},
+    PaintSink, RetainedDrawRef, StrokeRef,
+    record::{Scene, replay, replay_transformed},
 };
 use kurbo::{Affine, Rect};
 use peniko::{Brush, BrushRef, Fill};
@@ -161,6 +161,17 @@ impl<'a> VelloSceneSink<'a> {
     fn replay_masked_subscene(&mut self, scene: &Scene, transform: Affine) {
         replay_transformed(scene, self, transform);
     }
+
+    fn materialize_retained_scene(
+        &mut self,
+        retained: imaging::RetainedRef<'_>,
+    ) -> Result<vello::Scene, Error> {
+        let mut scene = vello::Scene::new();
+        let mut sink = VelloSceneSink::new(&mut scene, self.surface_clip);
+        replay(retained.scene, &mut sink);
+        sink.finish()?;
+        Ok(scene)
+    }
 }
 
 impl PaintSink for VelloSceneSink<'_> {
@@ -304,7 +315,7 @@ impl PaintSink for VelloSceneSink<'_> {
             );
         }
         self.push_group_frame(group.mask.map(|mask| PendingMask {
-            scene: mask.mask.scene.clone(),
+            scene: mask.mask.retained.scene.clone(),
             mode: mask.mask.mode,
             transform: mask.transform,
         }));
@@ -333,6 +344,29 @@ impl PaintSink for VelloSceneSink<'_> {
             self.scene.pop_layer();
         }
         self.scene.pop_layer();
+    }
+
+    fn retained(&mut self, draw: RetainedDrawRef<'_>) {
+        if self.error.is_some() {
+            return;
+        }
+        let retained = match self.materialize_retained_scene(draw.retained.clone()) {
+            Ok(scene) => scene,
+            Err(err) => {
+                self.set_error_once(err);
+                return;
+            }
+        };
+        if draw.composite != Composite::default() {
+            self.push_group(GroupRef::new().with_composite(draw.composite));
+            if self.error.is_some() {
+                return;
+            }
+        }
+        self.scene.append(&retained, Some(draw.transform));
+        if draw.composite != Composite::default() {
+            self.pop_group();
+        }
     }
 
     fn fill(&mut self, draw: FillRef<'_>) {

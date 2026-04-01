@@ -20,7 +20,7 @@ where
 
 struct EmitCx<'a> {
     masks: &'a [PlanMask],
-    materialized_masks: Vec<Option<record::Mask>>,
+    materialized_masks: Vec<Option<record::RetainedMask>>,
 }
 
 impl<'a> EmitCx<'a> {
@@ -108,7 +108,7 @@ impl<'a> EmitCx<'a> {
         }
     }
 
-    fn materialize_mask(&mut self, mask: PlanMaskId) -> record::Mask {
+    fn materialize_mask(&mut self, mask: PlanMaskId) -> record::RetainedMask {
         if let Some(mask_def) = self.materialized_masks[mask.0].as_ref() {
             return mask_def.clone();
         }
@@ -119,7 +119,7 @@ impl<'a> EmitCx<'a> {
             let mut painter = Painter::new(&mut scene);
             self.emit_nodes(&plan_mask.nodes, &mut painter);
         }
-        let materialized = record::Mask::new(plan_mask.mode, scene);
+        let materialized = record::RetainedMask::new(plan_mask.mode, record::Retained::new(scene));
         self.materialized_masks[mask.0] = Some(materialized.clone());
         materialized
     }

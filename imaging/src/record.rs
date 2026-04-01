@@ -7,6 +7,7 @@
 //! you need an owned semantic recording you can retain, validate, and replay.
 
 use alloc::{boxed::Box, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke};
 use peniko::{Brush, Fill, FontData, Style};
@@ -85,26 +86,172 @@ pub struct GroupId(pub(crate) u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MaskId(pub(crate) u32);
 
+/// Identifier for a retained subscene payload stored in a [`Scene`].
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RetainedId(pub(crate) u32);
+
 /// Identifier for a draw payload stored in a [`Scene`].
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DrawId(pub(crate) u32);
+
+/// A reusable retained subscene definition.
+#[derive(Clone, Debug)]
+pub struct Retained {
+    pub(crate) id: u64,
+    /// Scene contents of this retained subscene.
+    pub scene: Scene,
+    /// Optional explicit bounds for this retained subscene in local coordinates.
+    pub bounds: Option<Rect>,
+    /// Cache policy hint for backend-native retained acceleration.
+    pub cache_policy: RetainedCachePolicy,
+}
+
+/// Transform classes under which a cached retained image may be reused.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RetainedTransformPolicy {
+    /// Only reuse a cached image when the draw transform is exactly identity.
+    IdentityOnly,
+    /// Reuse a cached image across pure translations; scale/rotation/skew require a new image.
+    TranslationOnly,
+    /// Reuse a cached image across any draws with the same linear transform.
+    Linear,
+}
+
+/// Eviction policy for backend-native retained cache entries.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RetainedEvictionPolicy {
+    /// Keep the cached image until the first top-level render where it is not used.
+    UntilUnused,
+    /// Keep the cached image until it is explicitly cleared.
+    Manual,
+}
+
+/// Cache policy hint for backend-native retained acceleration.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RetainedCachePolicy {
+    /// Whether image caching is allowed, and under which transform reuse class.
+    pub image_transform: Option<RetainedTransformPolicy>,
+    /// How long backend-native cached images should live once created.
+    pub eviction: RetainedEvictionPolicy,
+}
+
+impl Default for RetainedCachePolicy {
+    fn default() -> Self {
+        Self {
+            image_transform: None,
+            eviction: RetainedEvictionPolicy::UntilUnused,
+        }
+    }
+}
+
+impl Retained {
+    /// Record a reusable retained subscene definition.
+    #[must_use]
+    pub fn record(
+        record: impl FnOnce(&mut crate::Painter<'_, Scene>),
+    ) -> Self {
+        let mut retained_scene = Scene::new();
+        {
+            let mut painter = crate::Painter::new(&mut retained_scene);
+            record(&mut painter);
+        }
+        Self::new(retained_scene)
+    }
+
+    /// Create a retained subscene from a scene recording.
+    #[must_use]
+    pub fn new(scene: Scene) -> Self {
+        static NEXT_RETAINED_ID: AtomicU64 = AtomicU64::new(1);
+
+        Self {
+            id: NEXT_RETAINED_ID.fetch_add(1, Ordering::Relaxed),
+            scene,
+            bounds: None,
+            cache_policy: RetainedCachePolicy::default(),
+        }
+    }
+
+    /// Attach explicit local bounds to this retained subscene.
+    #[must_use]
+    pub fn with_bounds(mut self, bounds: Rect) -> Self {
+        self.bounds = Some(bounds);
+        self
+    }
+
+    /// Attach backend cache policy hints to this retained subscene.
+    #[must_use]
+    pub fn with_cache_policy(mut self, cache_policy: RetainedCachePolicy) -> Self {
+        self.cache_policy = cache_policy;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_optional_bounds(mut self, bounds: Option<Rect>) -> Self {
+        self.bounds = bounds;
+        self
+    }
+
+    /// Stable identity for backend-side caches attached to this retained scene.
+    #[must_use]
+    pub fn stable_id(&self) -> u64 {
+        self.id
+    }
+
+    /// Interpret this retained subscene as a mask.
+    #[must_use]
+    pub fn into_mask(self, mode: MaskMode) -> RetainedMask {
+        RetainedMask {
+            mode,
+            retained: self,
+        }
+    }
+}
+
+impl PartialEq for Retained {
+    fn eq(&self, other: &Self) -> bool {
+        self.scene == other.scene
+            && self.bounds == other.bounds
+            && self.cache_policy == other.cache_policy
+    }
+}
+
+/// An owned reusable mask definition authored from retained scene content.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RetainedMask {
+    /// How this mask scene modulates masked content.
+    pub mode: MaskMode,
+    /// Reusable retained scene that produces mask coverage values.
+    pub retained: Retained,
+}
+
+impl RetainedMask {
+    /// Create a mask definition from retained scene content and interpretation mode.
+    #[must_use]
+    pub fn new(mode: MaskMode, retained: Retained) -> Self {
+        retained.into_mask(mode)
+    }
+}
+
+/// A draw of a retained subscene.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RetainedDraw {
+    /// Referenced retained subscene definition.
+    pub retained: RetainedId,
+    /// Transform applied when drawing the retained subscene.
+    pub transform: Affine,
+    /// Per-draw compositing.
+    pub composite: Composite,
+}
 
 /// A retained mask definition.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mask {
     /// How this mask scene modulates masked content.
     pub mode: MaskMode,
-    /// Scene that produces mask coverage values.
-    pub scene: Scene,
-}
-
-impl Mask {
-    /// Create a mask definition from a retained scene and interpretation mode.
-    #[must_use]
-    pub fn new(mode: MaskMode, scene: Scene) -> Self {
-        Self { mode, scene }
-    }
+    /// Reusable retained subscene that produces mask coverage values.
+    pub retained: RetainedId,
 }
 
 /// A use of a retained mask within an isolated group.
@@ -222,6 +369,8 @@ impl GlyphRun {
 /// [`crate::StrokeRef`] for normal command authoring.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Draw {
+    /// Draw a retained subscene.
+    Retained(RetainedDraw),
     /// Fill a shape.
     Fill {
         /// Geometry transform.
@@ -282,11 +431,49 @@ pub enum Command {
 pub struct Scene {
     commands: Vec<Command>,
     clips: Vec<Clip>,
+    retained: Vec<Retained>,
     masks: Vec<Mask>,
     groups: Vec<Group>,
     draws: Vec<Draw>,
 }
 
+/// Read-only source of replayable core imaging commands.
+pub trait ReplaySource {
+    /// Replay the source into a sink.
+    fn replay_into<S>(&self, sink: &mut S)
+    where
+        S: PaintSink + ?Sized;
+
+    /// Replay the source into a sink with an extra transform.
+    fn replay_into_transformed<S>(&self, sink: &mut S, transform: Affine)
+    where
+        S: PaintSink + ?Sized,
+    {
+        let mut sink = crate::paint::TransformingSink::new(sink, transform);
+        self.replay_into(&mut sink);
+    }
+}
+
+fn replay_draw<S>(retained: &[Retained], draw: &Draw, sink: &mut S)
+where
+    S: PaintSink + ?Sized,
+{
+    match draw {
+        Draw::Retained(draw) => sink.retained(draw.as_ref(&retained[draw.retained.0 as usize])),
+        Draw::GlyphRun(glyph_run) => {
+            let mut glyphs = glyph_run.glyphs.iter().copied();
+            sink.glyph_run(glyph_run.as_ref(), &mut glyphs);
+        }
+        draw => match draw.as_ref() {
+            crate::DrawRef::Fill(draw) => sink.fill(draw),
+            crate::DrawRef::Stroke(draw) => sink.stroke(draw),
+            crate::DrawRef::BlurredRoundedRect(draw) => sink.blurred_rounded_rect(draw),
+            crate::DrawRef::GlyphRun(_) => {
+                unreachable!("glyph runs are handled using the owned glyph slice")
+            }
+        },
+    }
+}
 impl Scene {
     /// Create an empty scene.
     #[inline]
@@ -299,6 +486,7 @@ impl Scene {
     pub fn clear(&mut self) {
         self.commands.clear();
         self.clips.clear();
+        self.retained.clear();
         self.masks.clear();
         self.groups.clear();
         self.draws.clear();
@@ -312,12 +500,14 @@ impl Scene {
         &mut self,
         commands: usize,
         clips: usize,
+        retained: usize,
         groups: usize,
         draws: usize,
         masks: usize,
     ) {
         self.commands.reserve(commands);
         self.clips.reserve(clips);
+        self.retained.reserve(retained);
         self.masks.reserve(masks);
         self.groups.reserve(groups);
         self.draws.reserve(draws);
@@ -329,9 +519,10 @@ impl Scene {
         self.reserve_additional(
             other.commands.len(),
             other.clips.len(),
-            other.masks.len(),
+            other.retained.len(),
             other.groups.len(),
             other.draws.len(),
+            other.masks.len(),
         );
     }
 
@@ -345,6 +536,12 @@ impl Scene {
     #[inline]
     pub fn clip(&self, id: ClipId) -> &Clip {
         &self.clips[id.0 as usize]
+    }
+
+    /// Resolve a retained subscene payload by ID.
+    #[inline]
+    pub fn retained(&self, id: RetainedId) -> &Retained {
+        &self.retained[id.0 as usize]
     }
 
     /// Resolve a mask payload by ID.
@@ -407,9 +604,25 @@ impl Scene {
         id
     }
 
+    /// Define a reusable retained subscene.
+    #[inline]
+    pub fn define_retained(&mut self, retained: Retained) -> RetainedId {
+        if let Some(idx) = self.retained.iter().position(|existing| existing == &retained) {
+            return RetainedId(u32::try_from(idx).expect("scene retained table overflow"));
+        }
+        let idx = u32::try_from(self.retained.len()).expect("scene retained table overflow");
+        let id = RetainedId(idx);
+        self.retained.push(retained);
+        id
+    }
+
     /// Define a reusable retained mask.
     #[inline]
-    pub fn define_mask(&mut self, mask: Mask) -> MaskId {
+    pub fn define_mask(&mut self, mask: RetainedMask) -> MaskId {
+        let mask = Mask {
+            mode: mask.mode,
+            retained: self.define_retained(mask.retained),
+        };
         if let Some(idx) = self.masks.iter().position(|existing| existing == &mask) {
             return MaskId(u32::try_from(idx).expect("scene mask table overflow"));
         }
@@ -424,8 +637,17 @@ impl Scene {
         let mut clip_depth = 0_u32;
         let mut group_depth = 0_u32;
 
+        for retained in &self.retained {
+            retained
+                .scene
+                .validate()
+                .map_err(|err| ValidateError::InvalidRetained(Box::new(err)))?;
+        }
+
         for mask in &self.masks {
-            mask.scene
+            let retained = self.retained(mask.retained);
+            retained
+                .scene
                 .validate()
                 .map_err(|err| ValidateError::InvalidMask(Box::new(err)))?;
         }
@@ -490,6 +712,19 @@ impl PaintSink for Scene {
     }
 
     #[inline]
+    fn retained(&mut self, draw: crate::RetainedDrawRef<'_>) {
+        let retained = self.define_retained(draw.retained.to_owned());
+        let _ = Self::draw(
+            self,
+            Draw::Retained(RetainedDraw {
+                retained,
+                transform: draw.transform,
+                composite: draw.composite,
+            }),
+        );
+    }
+
+    #[inline]
     fn fill(&mut self, draw: FillRef<'_>) {
         let _ = Self::draw(self, draw.to_owned());
     }
@@ -510,23 +745,43 @@ impl PaintSink for Scene {
     }
 }
 
-/// Replay a recorded [`Scene`] into a [`crate::PaintSink`].
-pub fn replay<S>(scene: &Scene, sink: &mut S)
-where
-    S: PaintSink + ?Sized,
-{
-    crate::paint::replay(scene, sink);
+impl ReplaySource for Scene {
+    #[inline]
+    fn replay_into<S>(&self, sink: &mut S)
+    where
+        S: PaintSink + ?Sized,
+     {
+         for cmd in &self.commands {
+             match *cmd {
+                Command::PushClip(id) => sink.push_clip(self.clip(id).as_ref()),
+                Command::PopClip => sink.pop_clip(),
+                Command::PushGroup(id) => sink.push_group(self.group(id).as_ref_with(self)),
+                Command::PopGroup => sink.pop_group(),
+                Command::Draw(id) => replay_draw(&self.retained, self.draw_op(id), sink),
+            }
+        }
+    }
 }
 
-/// Replay a recorded [`Scene`] into a [`crate::PaintSink`] with an extra transform.
+/// Replay a recorded source into a [`crate::PaintSink`].
+pub fn replay<R, S>(source: &R, sink: &mut S)
+where
+    R: ReplaySource + ?Sized,
+    S: PaintSink + ?Sized,
+{
+    source.replay_into(sink);
+}
+
+/// Replay a recorded source into a [`crate::PaintSink`] with an extra transform.
 ///
 /// The extra transform prefixes clip transforms, draw transforms, group clip transforms, and
 /// Existing brush transforms are preserved as-is.
-pub fn replay_transformed<S>(scene: &Scene, sink: &mut S, transform: Affine)
+pub fn replay_transformed<R, S>(source: &R, sink: &mut S, transform: Affine)
 where
+    R: ReplaySource + ?Sized,
     S: PaintSink + ?Sized,
 {
-    crate::paint::replay_transformed(scene, sink, transform);
+    source.replay_into_transformed(sink, transform);
 }
 
 /// Errors returned by [`Scene::validate`].
@@ -540,6 +795,8 @@ pub enum ValidateError {
     UnclosedClips,
     /// The command stream ended with open groups.
     UnclosedGroups,
+    /// A retained subscene definition was invalid.
+    InvalidRetained(Box<Self>),
     /// A retained mask definition was invalid.
     InvalidMask(Box<Self>),
 }
@@ -659,11 +916,14 @@ mod tests {
         invalid_mask.pop_clip();
 
         let mut scene = Scene::new();
-        scene.define_mask(Mask::new(MaskMode::Alpha, invalid_mask));
+        scene.define_mask(RetainedMask::new(
+            MaskMode::Alpha,
+            Retained::new(invalid_mask),
+        ));
 
         assert_eq!(
             scene.validate(),
-            Err(ValidateError::InvalidMask(Box::new(
+            Err(ValidateError::InvalidRetained(Box::new(
                 ValidateError::UnbalancedPopClip
             )))
         );
@@ -718,7 +978,10 @@ mod tests {
             composite: Composite::default(),
         });
         let mut source = Scene::new();
-        let mask_id = source.define_mask(Mask::new(MaskMode::Luminance, mask));
+        let mask_id = source.define_mask(RetainedMask::new(
+            MaskMode::Luminance,
+            Retained::new(mask),
+        ));
         let group = Group {
             mask: Some(AppliedMask {
                 mask: mask_id,

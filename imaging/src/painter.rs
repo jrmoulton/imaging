@@ -10,7 +10,7 @@ use peniko::{BrushRef, ImageBrushRef, Style};
 
 use crate::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, MaskMode,
-    NormalizedCoord, PaintSink, StrokeRef, record,
+    NormalizedCoord, PaintSink, RetainedDrawRef, RetainedRef, StrokeRef, record,
 };
 
 const DEFAULT_SHAPE_TOLERANCE: f64 = 0.1;
@@ -421,23 +421,40 @@ where
         self.pop_group();
     }
 
+    /// Record a reusable retained subscene definition.
+    #[must_use]
+    pub fn record_retained(
+        record: impl FnOnce(&mut Painter<'_, record::Scene>),
+    ) -> record::Retained {
+        record_retained(record)
+    }
+
+    /// Draw a previously recorded retained subscene.
+    pub fn draw_retained(
+        &mut self,
+        retained: RetainedRef<'_>,
+        transform: Affine,
+        composite: Composite,
+    ) {
+        self.sink.retained(
+            RetainedDrawRef::new(retained)
+                .transform(transform)
+                .composite(composite),
+        );
+    }
+
     /// Record a reusable retained mask definition.
     ///
     /// Prefer this when the same mask will be applied more than once. The returned
-    /// [`record::Mask`] can be reused through [`GroupRef::with_mask`] or
+    /// [`record::RetainedMask`] can be reused through [`GroupRef::with_mask`] or
     /// [`GroupRef::with_mask_transformed`]. `mode` controls whether the recorded mask scene is
     /// interpreted as alpha or luminance.
     #[must_use]
     pub fn record_mask(
         mode: MaskMode,
         mask: impl FnOnce(&mut Painter<'_, record::Scene>),
-    ) -> record::Mask {
-        let mut mask_scene = record::Scene::new();
-        {
-            let mut painter = Painter::new(&mut mask_scene);
-            mask(&mut painter);
-        }
-        record::Mask::new(mode, mask_scene)
+    ) -> record::RetainedMask {
+        record_mask(mode, mask)
     }
 
     /// Record a temporary one-off mask definition, then paint content through a masked isolated
@@ -453,6 +470,23 @@ where
         let mask = Self::record_mask(mode, mask);
         self.with_group(GroupRef::new().with_mask(mask.as_ref()), content);
     }
+}
+
+/// Record a reusable retained subscene definition.
+#[must_use]
+pub fn record_retained(
+    record: impl FnOnce(&mut Painter<'_, record::Scene>),
+) -> record::Retained {
+    record::Retained::record(record)
+}
+
+/// Record a reusable retained mask definition.
+#[must_use]
+pub fn record_mask(
+    mode: MaskMode,
+    mask: impl FnOnce(&mut Painter<'_, record::Scene>),
+) -> record::RetainedMask {
+    record_retained(mask).into_mask(mode)
 }
 
 #[cfg(test)]
@@ -481,6 +515,8 @@ mod tests {
         fn push_group(&mut self, _group: GroupRef<'_>) {}
 
         fn pop_group(&mut self) {}
+
+        fn retained(&mut self, _draw: RetainedDrawRef<'_>) {}
 
         fn fill(&mut self, _draw: FillRef<'_>) {}
 
@@ -703,7 +739,14 @@ mod tests {
                 record::Command::PopGroup,
             ]
         );
-        assert_eq!(scene.mask(record::MaskId(0)).scene.commands().len(), 1);
+        assert_eq!(
+            scene
+                .retained(scene.mask(record::MaskId(0)).retained)
+                .scene
+                .commands()
+                .len(),
+            1
+        );
         let group = scene.group(record::GroupId(0));
         let mask = group.mask.as_ref().expect("expected group mask");
         assert_eq!(scene.mask(mask.mask).mode, MaskMode::Alpha);
@@ -716,7 +759,7 @@ mod tests {
                 .draw();
         });
 
-        assert_eq!(mask.scene.commands().len(), 1);
+        assert_eq!(mask.retained.scene.commands().len(), 1);
         assert_eq!(mask.mode, MaskMode::Luminance);
     }
 }
