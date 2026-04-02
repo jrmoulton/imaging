@@ -261,7 +261,7 @@ use kurbo::{Affine, Shape as _};
 use peniko::color::{ColorSpaceTag, HueDirection, Srgb};
 use peniko::{BrushRef, ImageAlphaType, ImageFormat, ImageQuality, InterpolationAlphaSpace};
 use skia_safe as sk;
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::font_cache::skia_font_from_glyph_run;
 use crate::ganesh::{GaneshBackend, create_surface as create_ganesh_surface};
@@ -269,6 +269,50 @@ use std::sync::Arc;
 
 use sinks::{MaskImageCache, RetainedImageCache};
 pub use sinks::{SkCanvasSink, SkPictureRecorderSink};
+
+pub(crate) type ImageCacheHandle = Rc<RefCell<ImageCache>>;
+
+#[derive(Debug, Default)]
+pub(crate) struct ImageCache {
+    images: HashMap<ImageCacheKey, sk::Image>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ImageCacheKey {
+    blob_id: u64,
+    format: core::mem::Discriminant<ImageFormat>,
+    alpha_type: core::mem::Discriminant<ImageAlphaType>,
+    width: u32,
+    height: u32,
+}
+
+impl ImageCacheKey {
+    fn new(image: &peniko::ImageData) -> Self {
+        Self {
+            blob_id: image.data.id(),
+            format: core::mem::discriminant(&image.format),
+            alpha_type: core::mem::discriminant(&image.alpha_type),
+            width: image.width,
+            height: image.height,
+        }
+    }
+}
+
+impl ImageCache {
+    fn clear(&mut self) {
+        self.images.clear();
+    }
+
+    fn get_or_create(&mut self, image: &peniko::ImageData) -> Option<sk::Image> {
+        let key = ImageCacheKey::new(image);
+        if let Some(cached) = self.images.get(&key) {
+            return Some(cached.clone());
+        }
+        let sk_image = make_skia_image_from_peniko(image)?;
+        self.images.insert(key, sk_image.clone());
+        Some(sk_image)
+    }
+}
 
 /// Errors that can occur when rendering via Skia.
 #[derive(Debug)]
@@ -303,6 +347,7 @@ pub struct SkiaRenderer {
     backend: GaneshBackend,
     surface: sk::Surface,
     tolerance: f64,
+    image_cache: ImageCacheHandle,
     mask_cache: Rc<RefCell<MaskImageCache>>,
     retained_image_cache: Rc<RefCell<RetainedImageCache>>,
     frame_active: bool,
@@ -372,6 +417,7 @@ impl SkiaRenderer {
             backend,
             surface,
             tolerance: 0.1,
+            image_cache: Rc::new(RefCell::new(ImageCache::default())),
             mask_cache: Rc::new(RefCell::new(MaskImageCache::default())),
             retained_image_cache: Rc::new(RefCell::new(RetainedImageCache::default())),
             frame_active: false,
@@ -393,6 +439,7 @@ impl SkiaRenderer {
 
     /// Drop any realized native mask images cached by the renderer.
     pub fn clear_cached_masks(&mut self) {
+        self.image_cache.borrow_mut().clear();
         self.mask_cache.borrow_mut().clear();
         self.retained_image_cache.borrow_mut().clear();
     }
@@ -741,6 +788,7 @@ impl SkiaRenderer {
     fn canvas_sink(&mut self) -> SkCanvasSink<'_> {
         let mut sink = SkCanvasSink::new_with_mask_cache(
             self.surface.canvas(),
+            Some(Rc::clone(&self.image_cache)),
             Rc::clone(&self.mask_cache),
             Rc::clone(&self.retained_image_cache),
         );
@@ -983,6 +1031,7 @@ impl SkiaCpuRenderState {
     fn canvas_sink<'a>(&'a mut self, surface: &'a mut sk::Surface) -> SkCanvasSink<'a> {
         let mut sink = SkCanvasSink::new_with_mask_cache(
             surface.canvas(),
+            None,
             Rc::clone(&self.mask_cache),
             Rc::clone(&self.retained_image_cache),
         );
@@ -1488,7 +1537,12 @@ fn color_to_sk_color4f(color: peniko::Color) -> sk::Color4f {
 ///
 /// This is the main translation point from `imaging` brush semantics into Skia shaders, colors,
 /// image sampling, and opacity handling.
-fn brush_to_paint(brush: BrushRef<'_>, opacity: f32, paint_xf: Affine) -> Option<sk::Paint> {
+fn brush_to_paint(
+    brush: BrushRef<'_>,
+    opacity: f32,
+    paint_xf: Affine,
+    image_cache: Option<&ImageCacheHandle>,
+) -> Option<sk::Paint> {
     let mut paint = sk::Paint::default();
     paint.set_anti_alias(true);
     let alpha_scale = opacity.clamp(0.0, 1.0);
@@ -1611,7 +1665,7 @@ fn brush_to_paint(brush: BrushRef<'_>, opacity: f32, paint_xf: Affine) -> Option
             }
         }
         BrushRef::Image(image_brush) => {
-            let image = skia_image_from_peniko(image_brush.image)?;
+            let image = skia_image_from_peniko(image_brush.image, image_cache)?;
             let shader = image.to_shader(
                 Some((
                     tile_mode_from_extend(image_brush.sampler.x_extend),
@@ -1629,7 +1683,17 @@ fn brush_to_paint(brush: BrushRef<'_>, opacity: f32, paint_xf: Affine) -> Option
 }
 
 /// Convert a `peniko` image payload into a raster Skia image when its format is supported.
-fn skia_image_from_peniko(image: &peniko::ImageData) -> Option<sk::Image> {
+fn skia_image_from_peniko(
+    image: &peniko::ImageData,
+    image_cache: Option<&ImageCacheHandle>,
+) -> Option<sk::Image> {
+    if let Some(image_cache) = image_cache {
+        return image_cache.borrow_mut().get_or_create(image);
+    }
+    make_skia_image_from_peniko(image)
+}
+
+fn make_skia_image_from_peniko(image: &peniko::ImageData) -> Option<sk::Image> {
     let color_type = match image.format {
         ImageFormat::Rgba8 => sk::ColorType::RGBA8888,
         ImageFormat::Bgra8 => sk::ColorType::BGRA8888,

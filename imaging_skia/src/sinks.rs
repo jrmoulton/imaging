@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use super::{
-    Error, affine_to_matrix, apply_stroke_style, bez_to_sk_path, brush_to_paint,
+    Error, ImageCacheHandle, affine_to_matrix, apply_stroke_style, bez_to_sk_path, brush_to_paint,
     build_filter_chain, f64_to_f32, geometry_to_bez_path, geometry_to_sk_path, map_blend_mode,
     path_with_fill_rule, skia_font_from_glyph_run,
 };
@@ -183,6 +183,7 @@ struct StreamState {
     error: Option<Error>,
     clip_depth: u32,
     group_stack: Vec<GroupFrame>,
+    image_cache: Option<ImageCacheHandle>,
     mask_cache: Option<MaskImageCacheHandle>,
     retained_image_cache: Option<RetainedImageCacheHandle>,
 }
@@ -213,16 +214,19 @@ impl StreamState {
             error: None,
             clip_depth: 0,
             group_stack: Vec::new(),
+            image_cache: None,
             mask_cache: None,
             retained_image_cache: None,
         }
     }
 
     fn new_with_caches(
+        image_cache: Option<ImageCacheHandle>,
         mask_cache: MaskImageCacheHandle,
         retained_image_cache: RetainedImageCacheHandle,
     ) -> Self {
         Self {
+            image_cache,
             mask_cache: Some(mask_cache),
             retained_image_cache: Some(retained_image_cache),
             ..Self::new()
@@ -344,6 +348,7 @@ fn render_mask_image(
     surface.canvas().clear(sk::Color::TRANSPARENT);
     let mut sink = SkCanvasSink::new_internal_with_mask_cache(
         surface.canvas(),
+        state.image_cache.as_ref().cloned(),
         state
             .mask_cache
             .as_ref()
@@ -501,6 +506,7 @@ fn render_retained_image(
     surface.canvas().clear(sk::Color::TRANSPARENT);
     let mut sink = SkCanvasSink::new_internal_with_mask_cache(
         surface.canvas(),
+        state.image_cache.as_ref().cloned(),
         state
             .mask_cache
             .as_ref()
@@ -643,9 +649,12 @@ fn draw_glyph_run(
 
     set_matrix(canvas, glyph_run.transform);
 
-    let Some(mut sk_paint) =
-        brush_to_paint(glyph_run.brush, glyph_run.composite.alpha, Affine::IDENTITY)
-    else {
+    let Some(mut sk_paint) = brush_to_paint(
+        glyph_run.brush,
+        glyph_run.composite.alpha,
+        Affine::IDENTITY,
+        state.image_cache.as_ref(),
+    ) else {
         state.set_error_once(Error::Internal("invalid image brush"));
         return;
     };
@@ -750,11 +759,17 @@ fn draw_masked_group(canvas: &sk::Canvas, state: &mut StreamState, masked: Maske
 
     {
         let mut sink = match (
+            state.image_cache.as_ref().cloned(),
             state.mask_cache.as_ref().cloned(),
             state.retained_image_cache.as_ref().cloned(),
         ) {
-            (Some(mask_cache), Some(retained_image_cache)) => {
-                SkCanvasSink::new_with_mask_cache(canvas, mask_cache, retained_image_cache)
+            (Some(image_cache), Some(mask_cache), Some(retained_image_cache)) => {
+                SkCanvasSink::new_with_mask_cache(
+                    canvas,
+                    Some(image_cache),
+                    mask_cache,
+                    retained_image_cache,
+                )
             }
             _ => SkCanvasSink::new(canvas),
         };
@@ -923,6 +938,7 @@ fn paint_sink_fill(canvas: &sk::Canvas, state: &mut StreamState, draw: FillRef<'
         draw.brush,
         draw.composite.alpha,
         draw.brush_transform.unwrap_or(Affine::IDENTITY),
+        state.image_cache.as_ref(),
     ) else {
         state.set_error_once(Error::Internal("invalid image brush"));
         return;
@@ -973,6 +989,7 @@ fn paint_sink_stroke(canvas: &sk::Canvas, state: &mut StreamState, draw: StrokeR
         draw.brush,
         draw.composite.alpha,
         draw.brush_transform.unwrap_or(Affine::IDENTITY),
+        state.image_cache.as_ref(),
     ) else {
         state.set_error_once(Error::Internal("invalid image brush"));
         return;
@@ -1034,28 +1051,31 @@ impl<'a> SkCanvasSink<'a> {
 
     pub(crate) fn new_with_mask_cache(
         canvas: &'a sk::Canvas,
+        image_cache: Option<ImageCacheHandle>,
         mask_cache: MaskImageCacheHandle,
         retained_image_cache: RetainedImageCacheHandle,
     ) -> Self {
-        Self::new_with_caches(canvas, mask_cache, retained_image_cache)
+        Self::new_with_caches(canvas, image_cache, mask_cache, retained_image_cache)
     }
 
     pub(crate) fn new_internal_with_mask_cache(
         canvas: &'a sk::Canvas,
+        image_cache: Option<ImageCacheHandle>,
         mask_cache: MaskImageCacheHandle,
         retained_image_cache: RetainedImageCacheHandle,
     ) -> Self {
-        Self::new_with_caches(canvas, mask_cache, retained_image_cache)
+        Self::new_with_caches(canvas, image_cache, mask_cache, retained_image_cache)
     }
 
     fn new_with_caches(
         canvas: &'a sk::Canvas,
+        image_cache: Option<ImageCacheHandle>,
         mask_cache: MaskImageCacheHandle,
         retained_image_cache: RetainedImageCacheHandle,
     ) -> Self {
         Self {
             canvas,
-            state: StreamState::new_with_caches(mask_cache, retained_image_cache),
+            state: StreamState::new_with_caches(image_cache, mask_cache, retained_image_cache),
         }
     }
 
