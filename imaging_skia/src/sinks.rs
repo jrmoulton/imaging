@@ -331,7 +331,12 @@ fn render_mask_image(
     width: i32,
     height: i32,
 ) -> Result<sk::Image, Error> {
-    let info = canvas.image_info().with_dimensions((width, height));
+    let info = sk::ImageInfo::new(
+        (width, height),
+        sk::ColorType::RGBA8888,
+        sk::AlphaType::Premul,
+        None,
+    );
     let mut surface = canvas
         .new_surface(&info, None)
         .or_else(|| sk::surfaces::raster(&info, None, None))
@@ -483,7 +488,12 @@ fn render_retained_image(
     let transformed_bounds = linear_transform.transform_rect_bbox(local_bounds);
     let width = ceil_dim_to_i32(transformed_bounds.width())?;
     let height = ceil_dim_to_i32(transformed_bounds.height())?;
-    let info = canvas.image_info().with_dimensions((width, height));
+    let info = sk::ImageInfo::new(
+        (width, height),
+        sk::ColorType::RGBA8888,
+        sk::AlphaType::Premul,
+        None,
+    );
     let mut surface = canvas
         .new_surface(&info, None)
         .or_else(|| sk::surfaces::raster(&info, None, None))
@@ -793,14 +803,18 @@ fn draw_masked_group(canvas: &sk::Canvas, state: &mut StreamState, masked: Maske
     );
     let transformed_mask_bounds = linear_transform.transform_rect_bbox(mask_local_bounds);
     set_matrix(canvas, Affine::IDENTITY);
-    canvas.draw_image(
-        &mask_image,
-        (
-            f64_to_f32(transformed_mask_bounds.x0) + translation.x,
-            f64_to_f32(transformed_mask_bounds.y0) + translation.y,
-        ),
-        Some(&mask_paint),
+    let mask_origin = (
+        f64_to_f32(transformed_mask_bounds.x0) + translation.x,
+        f64_to_f32(transformed_mask_bounds.y0) + translation.y,
     );
+    if masked.mode == MaskMode::Luminance {
+        let mask_layer = sk::canvas::SaveLayerRec::default().paint(&mask_paint);
+        canvas.save_layer(&mask_layer);
+        canvas.draw_image(&mask_image, mask_origin, None);
+        canvas.restore();
+    } else {
+        canvas.draw_image(&mask_image, mask_origin, Some(&mask_paint));
+    }
     canvas.restore();
 
     if clip_path.is_some() {

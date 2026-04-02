@@ -253,7 +253,8 @@ mod vulkan;
 mod font_cache;
 mod ganesh;
 use imaging::{
-    Filter, GeometryRef,
+    BeginFrame, CpuBufferFormat, CpuBufferTarget, Filter, GeometryRef, PaintSink, RenderCore,
+    RenderOutput, Renderer, TargetRenderer,
     record::{Scene, ValidateError, replay},
 };
 use kurbo::{Affine, Shape as _};
@@ -304,6 +305,7 @@ pub struct SkiaRenderer {
     tolerance: f64,
     mask_cache: Rc<RefCell<MaskImageCache>>,
     retained_image_cache: Rc<RefCell<RetainedImageCache>>,
+    frame_active: bool,
     #[cfg(feature = "wgpu")]
     wgpu_backend_keepalive: Option<WgpuDeviceQueueKeepalive>,
     #[cfg(feature = "wgpu")]
@@ -372,6 +374,7 @@ impl SkiaRenderer {
             tolerance: 0.1,
             mask_cache: Rc::new(RefCell::new(MaskImageCache::default())),
             retained_image_cache: Rc::new(RefCell::new(RetainedImageCache::default())),
+            frame_active: false,
             #[cfg(feature = "wgpu")]
             wgpu_backend_keepalive: None,
             #[cfg(feature = "wgpu")]
@@ -395,11 +398,19 @@ impl SkiaRenderer {
     }
 
     fn begin_frame(&mut self) {
+        if self.frame_active {
+            return;
+        }
         self.retained_image_cache.borrow_mut().flip_mark();
+        self.frame_active = true;
     }
 
-    fn end_frame(&mut self) {
+    fn finish_frame(&mut self) {
+        if !self.frame_active {
+            return;
+        }
         self.retained_image_cache.borrow_mut().evict_unmarked();
+        self.frame_active = false;
     }
 
     #[cfg(feature = "wgpu")]
@@ -719,6 +730,7 @@ impl SkiaRenderer {
     /// and clear state regardless of what the previous frame left behind.
     pub fn reset(&mut self) -> Result<(), Error> {
         self.backend.ensure_current()?;
+        self.finish_frame();
         let canvas = self.surface.canvas();
         canvas.restore_to_count(1);
         canvas.reset_matrix();
@@ -753,7 +765,6 @@ impl SkiaRenderer {
         let mut sink = self.canvas_sink();
         let out = f(&mut sink);
         let finish_result = sink.finish();
-        self.end_frame();
         finish_result?;
         self.flush();
         Ok(out)
@@ -770,7 +781,6 @@ impl SkiaRenderer {
         let mut sink = self.canvas_sink();
         replay(scene, &mut sink);
         let finish_result = sink.finish();
-        self.end_frame();
         finish_result?;
         self.flush();
         Ok(())
@@ -782,6 +792,7 @@ impl SkiaRenderer {
     /// same renderer and readback path as scene-based rendering.
     pub fn render_picture(&mut self, picture: &sk::Picture) -> Result<(), Error> {
         self.backend.ensure_current()?;
+        self.begin_frame();
         self.surface.canvas().draw_picture(picture, None, None);
         self.flush();
         Ok(())
@@ -849,6 +860,53 @@ impl SkiaRenderer {
     }
 }
 
+impl RenderCore for SkiaRenderer {
+    fn render(&mut self, f: &mut dyn FnMut(&mut dyn PaintSink)) {
+        self.with_canvas_sink(|sink| f(sink))
+            .expect("render into imaging_skia gpu canvas sink");
+    }
+
+    fn finish(&mut self) {
+        self.finish_frame();
+        self.backend
+            .ensure_current()
+            .expect("make imaging_skia gpu backend current");
+        self.flush();
+    }
+
+    fn readback(&mut self) -> Option<RenderOutput> {
+        self.read_image().ok().map(RenderOutput::Image)
+    }
+
+    fn debug_info(&self) -> String {
+        "name: Skia\ninfo: imaging_skia::SkiaRenderer".to_string()
+    }
+}
+
+impl Renderer for SkiaRenderer {
+    type Target = peniko::ImageData;
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "Frame sizes are converted to whole pixels and then checked against `u16`."
+    )]
+    fn set_size(&mut self, frame: BeginFrame) {
+        let width = u16::try_from(frame.size.width as u32).expect("skia width out of range");
+        let height = u16::try_from(frame.size.height as u32).expect("skia height out of range");
+        if self.surface.width() != i32::from(width) || self.surface.height() != i32::from(height) {
+            *self = Self::try_new(width, height).expect("recreate imaging_skia renderer");
+        }
+    }
+
+    fn reset(&mut self) {
+        Self::reset(self).expect("reset imaging_skia renderer");
+    }
+
+    fn read_target(&mut self) -> Option<Self::Target> {
+        self.read_image().ok()
+    }
+}
+
 /// Reusable CPU raster replay state for Skia-backed rendering.
 ///
 /// This type keeps renderer-side state such as tolerance while callers provide the destination
@@ -858,6 +916,7 @@ pub struct SkiaCpuRenderState {
     tolerance: f64,
     mask_cache: Rc<RefCell<MaskImageCache>>,
     retained_image_cache: Rc<RefCell<RetainedImageCache>>,
+    frame_active: bool,
 }
 
 impl Default for SkiaCpuRenderState {
@@ -873,6 +932,7 @@ impl SkiaCpuRenderState {
             tolerance: 0.1,
             mask_cache: Rc::new(RefCell::new(MaskImageCache::default())),
             retained_image_cache: Rc::new(RefCell::new(RetainedImageCache::default())),
+            frame_active: false,
         }
     }
 
@@ -889,11 +949,19 @@ impl SkiaCpuRenderState {
     }
 
     fn begin_frame(&mut self) {
+        if self.frame_active {
+            return;
+        }
         self.retained_image_cache.borrow_mut().flip_mark();
+        self.frame_active = true;
     }
 
-    fn end_frame(&mut self) {
+    fn finish_frame(&mut self) {
+        if !self.frame_active {
+            return;
+        }
         self.retained_image_cache.borrow_mut().evict_unmarked();
+        self.frame_active = false;
     }
 
     /// Create a short-lived renderer view bound to a caller-provided raster surface.
@@ -932,7 +1000,6 @@ impl SkiaCpuRenderState {
         let mut sink = self.canvas_sink(surface);
         let out = f(&mut sink);
         let finish_result = sink.finish();
-        self.end_frame();
         finish_result?;
         Ok(out)
     }
@@ -950,6 +1017,7 @@ impl SkiaCpuRenderState {
         surface: &mut sk::Surface,
         picture: &sk::Picture,
     ) -> Result<(), Error> {
+        self.begin_frame();
         surface.canvas().draw_picture(picture, None, None);
         Ok(())
     }
@@ -1033,6 +1101,7 @@ impl SkiaCpuRenderer {
 
     /// Reset canvas state before starting a new frame on the owned surface.
     pub fn reset(&mut self) {
+        self.state.finish_frame();
         SkiaCpuRenderState::reset(&mut self.surface);
     }
 
@@ -1049,14 +1118,102 @@ impl SkiaCpuRenderer {
         self.state.render_scene(&mut self.surface, scene)
     }
 
+    /// Reset, render a recorded scene, and return RGBA8 bytes.
+    pub fn render_scene_rgba8(&mut self, scene: &Scene) -> Result<Vec<u8>, Error> {
+        self.reset();
+        self.render_scene(scene)?;
+        Ok(self.read_image()?.data.as_ref().to_vec())
+    }
+
     /// Draw a native Skia picture through the owned raster backend.
     pub fn render_picture(&mut self, picture: &sk::Picture) -> Result<(), Error> {
         self.state.render_picture(&mut self.surface, picture)
     }
 
+    /// Reset, draw a native Skia picture, and return RGBA8 bytes.
+    pub fn render_picture_rgba8(&mut self, picture: &sk::Picture) -> Result<Vec<u8>, Error> {
+        self.reset();
+        self.render_picture(picture)?;
+        Ok(self.read_image()?.data.as_ref().to_vec())
+    }
+
     /// Read back the current owned raster surface into an unpremultiplied RGBA8 image.
     pub fn read_image(&mut self) -> Result<peniko::ImageData, Error> {
         SkiaCpuRenderState::read_image(&mut self.surface)
+    }
+}
+
+/// CPU target renderer that binds reusable Skia CPU state to a caller-provided pixel buffer.
+pub struct SkiaCpuTargetRenderer<'a> {
+    state: SkiaCpuRenderState,
+    surface: sk::Borrows<'a, sk::Surface>,
+}
+
+impl<'a> core::fmt::Debug for SkiaCpuTargetRenderer<'a> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SkiaCpuTargetRenderer")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SkiaCpuTargetRenderer<'_> {
+    fn with_renderer<R>(&mut self, f: impl FnOnce(&mut SkiaCpuRendererRef<'_>) -> R) -> R {
+        let mut renderer = self.state.bind(&mut self.surface);
+        f(&mut renderer)
+    }
+
+    fn readback_image(&mut self) -> Result<peniko::ImageData, Error> {
+        self.with_renderer(|renderer| renderer.read_image())
+    }
+
+    fn with_canvas<R>(&mut self, f: &mut dyn FnMut(&mut dyn PaintSink) -> R) -> R {
+        let mut renderer = self.state.bind(&mut self.surface);
+        renderer
+            .with_canvas_sink(|sink| f(sink))
+            .expect("render into imaging_skia cpu target sink")
+    }
+}
+
+impl RenderCore for SkiaCpuTargetRenderer<'_> {
+    fn render(&mut self, f: &mut dyn FnMut(&mut dyn PaintSink)) {
+        self.with_canvas(&mut |canvas| f(canvas));
+    }
+
+    fn finish(&mut self) {
+        self.state.finish_frame();
+    }
+
+    fn readback(&mut self) -> Option<RenderOutput> {
+        self.readback_image().ok().map(RenderOutput::Image)
+    }
+
+    fn debug_info(&self) -> String {
+        "name: Skia CPU\ninfo: imaging_skia::SkiaCpuTargetRenderer".to_string()
+    }
+}
+
+impl<'a> TargetRenderer for SkiaCpuTargetRenderer<'a> {
+    type Target = CpuBufferTarget<'a>;
+
+    fn create(_frame: BeginFrame, target: Self::Target) -> Result<Self, String> {
+        let color_type = match target.format {
+            CpuBufferFormat::Rgba8Opaque => sk::ColorType::RGBA8888,
+            CpuBufferFormat::Bgra8Opaque => sk::ColorType::BGRA8888,
+        };
+        let info = sk::ImageInfo::new(
+            (target.width as i32, target.height as i32),
+            color_type,
+            sk::AlphaType::Opaque,
+            None,
+        );
+        let surface =
+            sk::surfaces::wrap_pixels(&info, target.buffer, Some(target.bytes_per_row), None)
+                .ok_or_else(|| "wrap skia cpu target pixels".to_string())?;
+        Ok(Self {
+            state: SkiaCpuRenderState::new(),
+            surface,
+        })
     }
 }
 
@@ -1070,6 +1227,7 @@ pub struct SkiaCpuRendererRef<'a> {
 impl SkiaCpuRendererRef<'_> {
     /// Reset canvas state before starting a new frame on the bound raster surface.
     pub fn reset(&mut self) {
+        self.state.finish_frame();
         SkiaCpuRenderState::reset(self.surface);
     }
 
