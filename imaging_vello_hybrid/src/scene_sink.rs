@@ -5,8 +5,7 @@ use super::Error;
 use crate::{VelloHybridRenderer, image_registry::HybridImageUploadSession};
 use imaging::{
     BlurredRoundedRect, ClipRef, Composite, FillRef, GeometryRef, GlyphRunRef, GroupRef, PaintSink,
-    RetainedDrawRef, StrokeRef,
-    record::replay_transformed,
+    RetainedDrawRef, StrokeRef, record::replay_transformed,
 };
 use kurbo::{Affine, Shape as _};
 use peniko::{Brush, BrushRef, ImageBrush, Style};

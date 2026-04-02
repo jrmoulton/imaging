@@ -474,9 +474,7 @@ where
 
 /// Record a reusable retained subscene definition.
 #[must_use]
-pub fn record_retained(
-    record: impl FnOnce(&mut Painter<'_, record::Scene>),
-) -> record::Retained {
+pub fn record_retained(record: impl FnOnce(&mut Painter<'_, record::Scene>)) -> record::Retained {
     record::Retained::record(record)
 }
 

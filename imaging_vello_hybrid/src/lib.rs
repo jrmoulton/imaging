@@ -148,7 +148,11 @@ mod image_registry;
 mod scene_sink;
 
 use image_registry::{HybridImageRegistry, HybridImageUploadSession};
-use imaging::record::{Scene, ValidateError, replay};
+use imaging::{
+    BeginFrame, CpuBufferFormat, CpuBufferTarget, PaintSink, RenderCore, RenderOutput,
+    TargetRenderer,
+    record::{Scene, ValidateError, replay},
+};
 use peniko::{Blob, ImageAlphaType, ImageData, ImageFormat};
 use std::sync::mpsc;
 use vello_hybrid::{RenderError, RenderSize, RenderTargetConfig};
@@ -230,6 +234,15 @@ pub struct VelloHybridRenderer {
     height: u16,
     tolerance: f64,
     image_registry: HybridImageRegistry,
+}
+
+/// CPU target renderer that records into a native hybrid scene and writes into a caller buffer.
+#[derive(Debug)]
+pub struct VelloHybridTargetRenderer<'a> {
+    renderer: VelloHybridRenderer,
+    scene: vello_hybrid::Scene,
+    target: CpuBufferTarget<'a>,
+    finished_image: Option<ImageData>,
 }
 
 impl VelloHybridRenderer {
@@ -363,7 +376,12 @@ impl VelloHybridRenderer {
         output: ImageOutputFormat,
     ) -> Result<ImageData, Error> {
         let mut bytes = vec![0_u8; usize::from(self.width) * usize::from(self.height) * 4];
-        self.render_vello_hybrid_scene_into(scene, &mut bytes, usize::from(self.width) * 4, output)?;
+        self.render_vello_hybrid_scene_into(
+            scene,
+            &mut bytes,
+            usize::from(self.width) * 4,
+            output,
+        )?;
         Ok(ImageData {
             data: Blob::new(std::sync::Arc::new(bytes)),
             format: output.format,
@@ -396,10 +414,15 @@ impl VelloHybridRenderer {
         dst: &mut [u8],
         bytes_per_row: usize,
     ) -> Result<(), Error> {
-        self.render_scene_into(scene, dst, bytes_per_row, ImageOutputFormat {
-            format: ImageFormat::Rgba8,
-            alpha_type: ImageAlphaType::AlphaPremultiplied,
-        })
+        self.render_scene_into(
+            scene,
+            dst,
+            bytes_per_row,
+            ImageOutputFormat {
+                format: ImageFormat::Rgba8,
+                alpha_type: ImageAlphaType::AlphaPremultiplied,
+            },
+        )
     }
 
     /// Render a recorded scene into an opaque BGRA8 buffer.
@@ -409,10 +432,15 @@ impl VelloHybridRenderer {
         dst: &mut [u8],
         bytes_per_row: usize,
     ) -> Result<(), Error> {
-        self.render_scene_into(scene, dst, bytes_per_row, ImageOutputFormat {
-            format: ImageFormat::Bgra8,
-            alpha_type: ImageAlphaType::AlphaPremultiplied,
-        })
+        self.render_scene_into(
+            scene,
+            dst,
+            bytes_per_row,
+            ImageOutputFormat {
+                format: ImageFormat::Bgra8,
+                alpha_type: ImageAlphaType::AlphaPremultiplied,
+            },
+        )
     }
 
     /// Render a native [`vello_hybrid::Scene`] and return an RGBA8 image (unpremultiplied).
@@ -430,10 +458,15 @@ impl VelloHybridRenderer {
         dst: &mut [u8],
         bytes_per_row: usize,
     ) -> Result<(), Error> {
-        self.render_vello_hybrid_scene_into(scene, dst, bytes_per_row, ImageOutputFormat {
-            format: ImageFormat::Rgba8,
-            alpha_type: ImageAlphaType::AlphaPremultiplied,
-        })
+        self.render_vello_hybrid_scene_into(
+            scene,
+            dst,
+            bytes_per_row,
+            ImageOutputFormat {
+                format: ImageFormat::Rgba8,
+                alpha_type: ImageAlphaType::AlphaPremultiplied,
+            },
+        )
     }
 
     /// Render a native [`vello_hybrid::Scene`] into an opaque BGRA8 buffer.
@@ -443,10 +476,15 @@ impl VelloHybridRenderer {
         dst: &mut [u8],
         bytes_per_row: usize,
     ) -> Result<(), Error> {
-        self.render_vello_hybrid_scene_into(scene, dst, bytes_per_row, ImageOutputFormat {
-            format: ImageFormat::Bgra8,
-            alpha_type: ImageAlphaType::AlphaPremultiplied,
-        })
+        self.render_vello_hybrid_scene_into(
+            scene,
+            dst,
+            bytes_per_row,
+            ImageOutputFormat {
+                format: ImageFormat::Bgra8,
+                alpha_type: ImageAlphaType::AlphaPremultiplied,
+            },
+        )
     }
 
     fn render_vello_hybrid_scene_into_output(
@@ -534,7 +572,8 @@ impl VelloHybridRenderer {
 
         match output.alpha_type {
             ImageAlphaType::Alpha => {
-                let pixmap = vello_common::pixmap::Pixmap::from_parts(pixels, self.width, self.height);
+                let pixmap =
+                    vello_common::pixmap::Pixmap::from_parts(pixels, self.width, self.height);
                 let unpremul = pixmap.take_unpremultiplied();
                 for (src_row, dst_row) in unpremul
                     .chunks_exact(width)
@@ -542,8 +581,12 @@ impl VelloHybridRenderer {
                 {
                     for (src, out) in src_row.iter().zip(dst_row[..width * 4].chunks_exact_mut(4)) {
                         match output.format {
-                            ImageFormat::Rgba8 => out.copy_from_slice(&[src.r, src.g, src.b, src.a]),
-                            ImageFormat::Bgra8 => out.copy_from_slice(&[src.b, src.g, src.r, src.a]),
+                            ImageFormat::Rgba8 => {
+                                out.copy_from_slice(&[src.r, src.g, src.b, src.a]);
+                            }
+                            ImageFormat::Bgra8 => {
+                                out.copy_from_slice(&[src.b, src.g, src.r, src.a]);
+                            }
                             _ => return Err(Error::Internal("unsupported image format")),
                         }
                     }
@@ -558,7 +601,9 @@ impl VelloHybridRenderer {
                         let rgba = src.to_u8_array();
                         match output.format {
                             ImageFormat::Rgba8 => out.copy_from_slice(&rgba),
-                            ImageFormat::Bgra8 => out.copy_from_slice(&[rgba[2], rgba[1], rgba[0], rgba[3]]),
+                            ImageFormat::Bgra8 => {
+                                out.copy_from_slice(&[rgba[2], rgba[1], rgba[0], rgba[3]]);
+                            }
                             _ => return Err(Error::Internal("unsupported image format")),
                         }
                     }
@@ -566,6 +611,84 @@ impl VelloHybridRenderer {
             }
         }
         Ok(())
+    }
+}
+
+impl VelloHybridTargetRenderer<'_> {
+    fn with_scene_sink<R>(&mut self, f: &mut dyn FnMut(&mut dyn PaintSink) -> R) -> R {
+        let mut sink = VelloHybridSceneSink::with_renderer(&mut self.scene, &mut self.renderer);
+        let out = f(&mut sink);
+        let _ = sink.finish();
+        out
+    }
+
+    fn read_image_from_target(&self) -> ImageData {
+        let data = match self.target.format {
+            CpuBufferFormat::Rgba8Opaque => self.target.buffer.to_vec(),
+            CpuBufferFormat::Bgra8Opaque => {
+                let mut rgba = Vec::with_capacity(self.target.buffer.len());
+                for pixel in self.target.buffer.chunks_exact(4) {
+                    rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                }
+                rgba
+            }
+        };
+        ImageData {
+            data: Blob::new(std::sync::Arc::new(data)),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::AlphaPremultiplied,
+            width: self.target.width,
+            height: self.target.height,
+        }
+    }
+}
+
+impl RenderCore for VelloHybridTargetRenderer<'_> {
+    fn render(&mut self, f: &mut dyn FnMut(&mut dyn PaintSink)) {
+        self.with_scene_sink(&mut |canvas| f(canvas));
+    }
+
+    fn finish(&mut self) {
+        let output = match self.target.format {
+            CpuBufferFormat::Rgba8Opaque => ImageOutputFormat::RGBA8_PREMULTIPLIED,
+            CpuBufferFormat::Bgra8Opaque => ImageOutputFormat::BGRA8_PREMULTIPLIED,
+        };
+        let result = self.renderer.render_vello_hybrid_scene_into(
+            &self.scene,
+            self.target.buffer,
+            self.target.bytes_per_row,
+            output,
+        );
+        self.finished_image = result.ok().map(|_| self.read_image_from_target());
+    }
+
+    fn readback(&mut self) -> Option<RenderOutput> {
+        self.finished_image
+            .clone()
+            .or_else(|| Some(self.read_image_from_target()))
+            .map(RenderOutput::Image)
+    }
+
+    fn debug_info(&self) -> String {
+        "name: Vello Hybrid\ninfo: imaging_vello_hybrid".to_string()
+    }
+}
+
+impl<'a> TargetRenderer for VelloHybridTargetRenderer<'a> {
+    type Target = CpuBufferTarget<'a>;
+
+    fn create(_frame: BeginFrame, target: Self::Target) -> Result<Self, String> {
+        let width_u16 = u16::try_from(target.width)
+            .map_err(|_| "width exceeds vello_hybrid limit".to_string())?;
+        let height_u16 = u16::try_from(target.height)
+            .map_err(|_| "height exceeds vello_hybrid limit".to_string())?;
+        Ok(Self {
+            renderer: VelloHybridRenderer::try_new(width_u16, height_u16)
+                .map_err(|err| format!("{err:?}"))?,
+            scene: vello_hybrid::Scene::new(width_u16, height_u16),
+            target,
+            finished_image: None,
+        })
     }
 }
 

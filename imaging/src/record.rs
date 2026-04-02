@@ -149,9 +149,7 @@ impl Default for RetainedCachePolicy {
 impl Retained {
     /// Record a reusable retained subscene definition.
     #[must_use]
-    pub fn record(
-        record: impl FnOnce(&mut crate::Painter<'_, Scene>),
-    ) -> Self {
+    pub fn record(record: impl FnOnce(&mut crate::Painter<'_, Scene>)) -> Self {
         let mut retained_scene = Scene::new();
         {
             let mut painter = crate::Painter::new(&mut retained_scene);
@@ -607,7 +605,11 @@ impl Scene {
     /// Define a reusable retained subscene.
     #[inline]
     pub fn define_retained(&mut self, retained: Retained) -> RetainedId {
-        if let Some(idx) = self.retained.iter().position(|existing| existing == &retained) {
+        if let Some(idx) = self
+            .retained
+            .iter()
+            .position(|existing| existing == &retained)
+        {
             return RetainedId(u32::try_from(idx).expect("scene retained table overflow"));
         }
         let idx = u32::try_from(self.retained.len()).expect("scene retained table overflow");
@@ -750,9 +752,9 @@ impl ReplaySource for Scene {
     fn replay_into<S>(&self, sink: &mut S)
     where
         S: PaintSink + ?Sized,
-     {
-         for cmd in &self.commands {
-             match *cmd {
+    {
+        for cmd in &self.commands {
+            match *cmd {
                 Command::PushClip(id) => sink.push_clip(self.clip(id).as_ref()),
                 Command::PopClip => sink.pop_clip(),
                 Command::PushGroup(id) => sink.push_group(self.group(id).as_ref_with(self)),
@@ -978,10 +980,8 @@ mod tests {
             composite: Composite::default(),
         });
         let mut source = Scene::new();
-        let mask_id = source.define_mask(RetainedMask::new(
-            MaskMode::Luminance,
-            Retained::new(mask),
-        ));
+        let mask_id =
+            source.define_mask(RetainedMask::new(MaskMode::Luminance, Retained::new(mask)));
         let group = Group {
             mask: Some(AppliedMask {
                 mask: mask_id,

@@ -292,14 +292,12 @@ fn retained_image_cache_key_for_policy(
                 1.0_f64.to_bits(),
             ]
         }
-        RetainedTransformPolicy::TranslationOnly => {
-            [
-                1.0_f64.to_bits(),
-                0.0_f64.to_bits(),
-                0.0_f64.to_bits(),
-                1.0_f64.to_bits(),
-            ]
-        }
+        RetainedTransformPolicy::TranslationOnly => [
+            1.0_f64.to_bits(),
+            0.0_f64.to_bits(),
+            0.0_f64.to_bits(),
+            1.0_f64.to_bits(),
+        ],
         RetainedTransformPolicy::Linear => [a.to_bits(), b.to_bits(), c.to_bits(), d.to_bits()],
     };
     Some(RetainedImageCacheKey {

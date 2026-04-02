@@ -484,7 +484,10 @@ impl<'a> RetainedDrawRef<'a> {
 
     /// Convert a borrowed retained draw into an owned [`Draw`].
     #[must_use]
-    pub fn to_owned(self, define_retained: &mut impl FnMut(RetainedRef<'_>) -> crate::record::RetainedId) -> Draw {
+    pub fn to_owned(
+        self,
+        define_retained: &mut impl FnMut(RetainedRef<'_>) -> crate::record::RetainedId,
+    ) -> Draw {
         Draw::Retained(RetainedDraw {
             retained: define_retained(self.retained),
             transform: self.transform,
@@ -845,13 +848,10 @@ impl Group {
     pub fn as_ref_with<'a>(&'a self, scene: &'a Scene) -> GroupRef<'a> {
         GroupRef {
             clip: self.clip.as_ref().map(Clip::as_ref),
-            mask: self
-                .mask
-                .as_ref()
-                .map(|mask| {
-                    let stored_mask = scene.mask(mask.mask);
-                    mask.as_ref(stored_mask, scene.retained(stored_mask.retained))
-                }),
+            mask: self.mask.as_ref().map(|mask| {
+                let stored_mask = scene.mask(mask.mask);
+                mask.as_ref(stored_mask, scene.retained(stored_mask.retained))
+            }),
             filters: &self.filters,
             composite: self.composite,
         }
