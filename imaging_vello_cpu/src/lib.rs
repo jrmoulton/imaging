@@ -66,17 +66,22 @@
 extern crate alloc;
 
 use alloc::collections::VecDeque;
+use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use imaging::{
-    BeginFrame, BlurredRoundedRect, ClipRef, Composite, CpuBufferFormat, CpuBufferTarget, FillRef,
-    Filter, GeometryRef, GlyphRunRef, GroupRef, MaskMode, PaintSink, RenderCore, RenderOutput,
-    Renderer, RetainedDrawRef, StrokeRef, TargetRenderer,
+    BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GeometryRef, GlyphRunRef, GroupRef,
+    MaskMode, PaintSink, RetainedDrawRef, StrokeRef,
     record::{Scene, ValidateError, replay, replay_transformed},
 };
-use kurbo::{Affine, Rect, Shape as _};
+use core::convert::Infallible;
+use imaging_backend::{
+    Backend as ImagingBackend, CpuBufferAlphaMode, CpuBufferChannelOrder, CpuBufferTarget,
+    RenderOutput, RenderSource,
+};
+use kurbo::{Affine, Rect, Shape as _, Size};
 use peniko::{BlendMode, Brush, BrushRef, Fill, Style};
 use vello_common::filter_effects::{EdgeMode, Filter as VelloFilter, FilterGraph, FilterPrimitive};
 use vello_common::glyph::Glyph as VelloGlyph;
@@ -652,13 +657,7 @@ impl PaintSink for VelloCpuRenderer {
     }
 }
 
-impl RenderCore for VelloCpuRenderer {
-    fn render(&mut self, f: &mut dyn FnMut(&mut dyn PaintSink)) {
-        f(self);
-    }
-
-    fn finish(&mut self) {}
-
+impl VelloCpuRenderer {
     fn readback(&mut self) -> Option<RenderOutput> {
         self.read_rgba8().ok().map(|bytes| {
             RenderOutput::Image(peniko::ImageData {
@@ -670,81 +669,79 @@ impl RenderCore for VelloCpuRenderer {
             })
         })
     }
-
-    fn debug_info(&self) -> String {
-        String::from("name: Vello CPU\ninfo: imaging_vello_cpu::VelloCpuRenderer")
-    }
 }
 
-impl Renderer for VelloCpuRenderer {
-    type Target = peniko::ImageData;
-
+impl VelloCpuRenderer {
     #[allow(
         clippy::cast_possible_truncation,
         reason = "Frame sizes are converted to whole pixels and then checked against `u16`."
     )]
-    fn set_size(&mut self, frame: BeginFrame) {
-        let width = u16::try_from(frame.size.width as u32).expect("vello cpu width out of range");
-        let height =
-            u16::try_from(frame.size.height as u32).expect("vello cpu height out of range");
+    fn set_size(&mut self, size: Size) {
+        let width = u16::try_from(size.width as u32).expect("vello cpu width out of range");
+        let height = u16::try_from(size.height as u32).expect("vello cpu height out of range");
         if self.width != width || self.height != height {
             *self = Self::new(width, height);
         }
     }
 
-    fn reset(&mut self) {
+    fn reset_for_frame(&mut self) {
         Self::reset(self);
     }
-
-    fn read_target(&mut self) -> Option<Self::Target> {
-        self.readback().and_then(RenderOutput::into_image)
-    }
 }
 
-/// CPU target renderer that writes Vello CPU output into a caller-provided byte buffer.
-#[derive(Debug)]
-pub struct VelloCpuTargetRenderer<'a> {
-    inner: VelloCpuRenderer,
-    target: CpuBufferTarget<'a>,
-}
+impl ImagingBackend for VelloCpuRenderer {
+    type Error = String;
+    type Image = peniko::ImageData;
+    type BufferTarget<'a> = CpuBufferTarget<'a>;
+    type TextureTarget<'a> = Infallible;
 
-impl RenderCore for VelloCpuTargetRenderer<'_> {
-    fn render(&mut self, f: &mut dyn FnMut(&mut dyn PaintSink)) {
-        f(&mut self.inner);
-    }
-
-    fn finish(&mut self) {
-        match self.target.format {
-            CpuBufferFormat::Rgba8Opaque => {
-                let _ = self
-                    .inner
-                    .read_into_rgba8_opaque(self.target.buffer, self.target.bytes_per_row);
-            }
-            CpuBufferFormat::Bgra8Opaque => {
-                let _ = self
-                    .inner
-                    .read_into_bgra8_opaque(self.target.buffer, self.target.bytes_per_row);
-            }
+    fn render_to_buffer<'a>(
+        &mut self,
+        size: Size,
+        source: &mut dyn RenderSource,
+        target: Self::BufferTarget<'a>,
+    ) -> Result<(), Self::Error> {
+        if target.format.alpha_mode != CpuBufferAlphaMode::Opaque {
+            return Err(String::from(
+                "vello cpu buffer backend only supports opaque CPU targets",
+            ));
+        }
+        self.set_size(size);
+        self.reset_for_frame();
+        source.paint_into(self);
+        match target.format.channel_order {
+            CpuBufferChannelOrder::Rgba8 => self
+                .read_into_rgba8_opaque(target.buffer, target.bytes_per_row)
+                .map_err(|err| format!("{err:?}")),
+            CpuBufferChannelOrder::Bgra8 => self
+                .read_into_bgra8_opaque(target.buffer, target.bytes_per_row)
+                .map_err(|err| format!("{err:?}")),
         }
     }
 
-    fn readback(&mut self) -> Option<RenderOutput> {
-        self.inner.readback()
+    fn render_to_texture<'a>(
+        &mut self,
+        _size: Size,
+        _source: &mut dyn RenderSource,
+        target: Self::TextureTarget<'a>,
+    ) -> Result<(), Self::Error> {
+        match target {}
     }
-}
 
-impl<'a> TargetRenderer for VelloCpuTargetRenderer<'a> {
-    type Target = CpuBufferTarget<'a>;
-
-    fn create(_frame: BeginFrame, target: Self::Target) -> Result<Self, String> {
-        let width = u16::try_from(target.width)
-            .map_err(|_| String::from("vello cpu width out of range"))?;
-        let height = u16::try_from(target.height)
-            .map_err(|_| String::from("vello cpu height out of range"))?;
-        Ok(Self {
-            inner: VelloCpuRenderer::new(width, height),
-            target,
-        })
+    fn render_to_image(
+        &mut self,
+        size: Size,
+        source: &mut dyn RenderSource,
+        width: u32,
+        height: u32,
+    ) -> Result<Self::Image, Self::Error> {
+        let _ = size;
+        self.set_size(Size::new(width as f64, height as f64));
+        self.reset_for_frame();
+        source.paint_into(self);
+        self.readback()
+            .and_then(RenderOutput::into_image)
+            .ok_or_else(|| String::from("vello cpu image backend did not produce an image"))
     }
 }
 

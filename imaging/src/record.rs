@@ -9,7 +9,7 @@
 use alloc::{boxed::Box, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke};
+use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke, Vec2};
 use peniko::{Brush, Fill, FontData, Style};
 
 use crate::{
@@ -328,6 +328,8 @@ pub struct GlyphRun {
     pub glyph_transform: Option<Affine>,
     /// Font size in pixels per em.
     pub font_size: f32,
+    /// Faux-bold strength applied during glyph rasterization.
+    pub font_embolden: Vec2,
     /// Whether glyph hinting is enabled.
     pub hint: bool,
     /// Normalized variation coordinates for variable fonts.
@@ -351,6 +353,7 @@ impl GlyphRun {
             transform: Affine::IDENTITY,
             glyph_transform: None,
             font_size: 16.0,
+            font_embolden: Vec2::ZERO,
             hint: false,
             normalized_coords: Vec::new(),
             style: Style::Fill(Fill::NonZero),
@@ -850,20 +853,13 @@ mod tests {
         });
         let font = FontData::new(peniko::Blob::new(Arc::new([0_u8, 1_u8, 2_u8, 3_u8])), 0);
         a.draw(Draw::GlyphRun(GlyphRun {
-            font,
-            transform: Affine::IDENTITY,
-            glyph_transform: None,
             font_size: 12.0,
-            hint: false,
-            normalized_coords: Vec::new(),
-            style: Style::Fill(Fill::NonZero),
             glyphs: vec![Glyph {
                 id: 7,
                 x: 0.0,
                 y: 0.0,
             }],
-            brush: Brush::Solid(peniko::Color::BLACK),
-            composite: Composite::default(),
+            ..GlyphRun::new(font)
         }));
         a.draw(Draw::BlurredRoundedRect(BlurredRoundedRect {
             transform: Affine::IDENTITY,

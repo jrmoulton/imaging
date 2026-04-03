@@ -2,8 +2,10 @@
 
 Skia backend for the `imaging` command stream.
 
-`SkiaRenderer` is the Ganesh-backed GPU renderer. `SkiaCpuRenderState` is the reusable CPU raster
-backend, and `SkiaCpuRenderer` is its owned convenience wrapper.
+`SkiaGpuRenderer` is the owned Ganesh-backed GPU renderer. `SkiaGpuTargetRenderer` is the
+direct-to-texture GPU variant. `SkiaCpuTargetRenderer` is the caller-targeted CPU backend, and
+`SkiaCpuRenderer` is the owned CPU convenience wrapper. `CommonRendererState` remains the reusable
+lower-level CPU raster state shared by those CPU entry points.
 
 The Ganesh backend is adapted in part from `anyrender_skia` from the AnyRender project, with the
 borrowed backend-initialization code carrying attribution in the copied source files.

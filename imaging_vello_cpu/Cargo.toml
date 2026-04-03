@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 imaging.workspace = true
+imaging_backend = { path = "../imaging_backend" }
 kurbo.workspace = true
 peniko.workspace = true
 vello_common = { default-features = false, version = "0.0.7" }

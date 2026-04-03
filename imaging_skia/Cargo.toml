@@ -17,6 +17,7 @@ wgpu = ["dep:wgpu", "dep:foreign-types-shared"]
 [dependencies]
 foreign-types-shared = { optional = true, version = "0.3" }
 imaging = { features = ["std"], workspace = true }
+imaging_backend = { path = "../imaging_backend" }
 kurbo = { default-features = true, workspace = true }
 oaty = "0.1"
 peniko = { default-features = true, workspace = true }

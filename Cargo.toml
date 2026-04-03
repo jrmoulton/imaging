@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "imaging_backend",
     "imaging",
     "imaging_conformance",
     "imaging_skia",

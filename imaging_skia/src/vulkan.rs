@@ -21,8 +21,8 @@ use std::ffi::CString;
 use std::sync::Arc;
 
 use crate::{
-    Error, SkiaRenderer, color_space_for_wgpu_texture_format, color_type_for_wgpu_texture_format,
-    ganesh::GaneshBackend,
+    Error, SkiaGpuRenderer, SkiaGpuTargetRenderer, SkiaRendererImpl,
+    color_type_for_wgpu_texture_format, ganesh::GaneshBackend,
 };
 
 #[derive(Debug)]
@@ -168,7 +168,7 @@ impl Drop for VulkanBackend {
     reason = "Raw Vulkan interop needs the full image description."
 )]
 /// Wrap a caller-owned Vulkan image in a Skia surface for direct rendering.
-fn create_wrapped_vulkan_surface(
+pub(crate) fn create_wrapped_vulkan_surface(
     context: &mut sk::gpu::DirectContext,
     width: i32,
     height: i32,
@@ -208,7 +208,7 @@ fn create_wrapped_vulkan_surface(
         sk::gpu::SurfaceOrigin::TopLeft,
         None,
         color_type_for_wgpu_texture_format(texture_format)?,
-        color_space_for_wgpu_texture_format(texture_format),
+        None,
         None,
     )
     .ok_or(Error::CreateGpuSurface)
@@ -234,7 +234,7 @@ fn vk_format_for_wgpu_texture_format(
 }
 
 #[cfg(feature = "wgpu")]
-impl SkiaRenderer {
+impl SkiaGpuRenderer {
     /// Create an offscreen renderer backed by caller-owned Vulkan handles.
     ///
     /// Use this when `wgpu` or another embedding layer already owns the Vulkan instance, device,
@@ -282,6 +282,58 @@ impl SkiaRenderer {
         Ok(Self::from_backend_surface(backend, surface))
     }
 
+}
+
+#[cfg(feature = "wgpu")]
+impl<M> SkiaRendererImpl<M> {
+    pub(crate) unsafe fn create_vulkan_surface(
+        &mut self,
+        width: u16,
+        height: u16,
+        texture_format: wgpu::TextureFormat,
+        image: ash::vk::Image,
+        image_layout: ash::vk::ImageLayout,
+        image_usage_flags: ash::vk::ImageUsageFlags,
+        level_count: u32,
+        queue_family_index: u32,
+    ) -> Result<sk::Surface, Error> {
+        let width = i32::from(width);
+        let height = i32::from(height);
+        self.state.backend.ensure_current()?;
+        create_wrapped_vulkan_surface(
+            self.state.backend.direct_context(),
+            width,
+            height,
+            texture_format,
+            image,
+            image_layout,
+            image_usage_flags.as_raw() as _,
+            level_count,
+            queue_family_index,
+        )
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl SkiaGpuTargetRenderer {
+    /// Create a renderer backed by caller-owned Vulkan handles for later target binding.
+    pub unsafe fn try_new_vulkan_from_raw_handles(
+        instance: ash::vk::Instance,
+        physical_device: ash::vk::PhysicalDevice,
+        device: ash::vk::Device,
+        queue: ash::vk::Queue,
+        queue_family_index: u32,
+    ) -> Result<Self, Error> {
+        let backend = GaneshBackend::Vulkan(VulkanBackend::from_raw_handles(
+            instance,
+            physical_device,
+            device,
+            queue,
+            queue_family_index,
+        )?);
+        Ok(Self::from_backend(backend))
+    }
+
     /// Create a renderer that draws directly into a caller-owned Vulkan image.
     ///
     /// This is the explicit Vulkan interop entry point for applications that already manage their
@@ -310,29 +362,24 @@ impl SkiaRenderer {
         image_usage_flags: ash::vk::ImageUsageFlags,
         level_count: u32,
     ) -> Result<Self, Error> {
-        use ash::vk::Handle as _;
-
-        let width = i32::from(width);
-        let height = i32::from(height);
-        let mut backend = GaneshBackend::Vulkan(VulkanBackend::from_raw_handles(
-            instance,
-            physical_device,
-            device,
-            queue,
-            queue_family_index,
-        )?);
-        let surface = create_wrapped_vulkan_surface(
-            backend.direct_context(),
+        let _ = (
             width,
             height,
             texture_format,
             image,
             image_layout,
-            image_usage_flags.as_raw() as _,
+            image_usage_flags,
             level_count,
-            queue_family_index,
-        )?;
-        Ok(Self::from_backend_surface(backend, surface))
+        );
+        unsafe {
+            Self::try_new_vulkan_from_raw_handles(
+                instance,
+                physical_device,
+                device,
+                queue,
+                queue_family_index,
+            )
+        }
     }
 
     /// Retarget the renderer to a different caller-owned Vulkan image.
@@ -354,22 +401,18 @@ impl SkiaRenderer {
         level_count: u32,
         queue_family_index: u32,
     ) -> Result<(), Error> {
-        let width = i32::from(width);
-        let height = i32::from(height);
-        self.backend.ensure_current()?;
-        self.backend.flush_surface(&mut self.surface);
-        let surface = create_wrapped_vulkan_surface(
-            self.backend.direct_context(),
-            width,
-            height,
-            texture_format,
-            image,
-            image_layout,
-            image_usage_flags.as_raw() as _,
-            level_count,
-            queue_family_index,
-        )?;
-        self.surface = surface;
+        let _ = unsafe {
+            self.create_vulkan_surface(
+                width,
+                height,
+                texture_format,
+                image,
+                image_layout,
+                image_usage_flags,
+                level_count,
+                queue_family_index,
+            )
+        }?;
         Ok(())
     }
 }

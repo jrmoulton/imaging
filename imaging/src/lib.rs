@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
@@ -111,7 +113,6 @@ use peniko::BlendMode;
 mod paint;
 mod painter;
 pub mod record;
-mod renderer;
 pub mod validation;
 
 pub use paint::{
@@ -124,10 +125,6 @@ pub use painter::{
 pub use record::{
     ReplaySource, Retained, RetainedCachePolicy, RetainedEvictionPolicy, RetainedMask,
     RetainedTransformPolicy,
-};
-pub use renderer::{
-    BeginFrame, CpuBufferFormat, CpuBufferTarget, CpuBufferTargetInfo, GlyphIter, GpuTextureTarget,
-    RenderCore, RenderOutput, Renderer, TargetRenderer,
 };
 
 /// Normalized variable-font coordinate value.

@@ -70,6 +70,8 @@
 //! assert_eq!(scene.commands().len(), 1);
 //! ```
 
+use alloc::vec::Vec;
+
 use crate::{
     AppliedMaskRef, BlurredRoundedRect, ClipRef, Composite, FillRef, Filter, GlyphRunRef, GroupRef,
     PaintSink, StrokeRef,
@@ -803,15 +805,8 @@ mod tests {
         let paint = Brush::Solid(Color::BLACK);
         sink.glyph_run(
             GlyphRunRef {
-                font: &font,
-                transform: Affine::IDENTITY,
-                glyph_transform: None,
                 font_size: -1.0,
-                hint: false,
-                normalized_coords: &[],
-                style: &style,
-                brush: (&paint).into(),
-                composite: Composite::default(),
+                ..GlyphRunRef::new(&font, &style, &paint)
             },
             &mut glyphs.into_iter(),
         );

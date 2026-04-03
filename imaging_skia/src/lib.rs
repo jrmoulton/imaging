@@ -7,8 +7,9 @@
 //!
 //! At a high level, there are three ways to use it:
 //!
-//! - [`SkiaRenderer`] renders through Skia Ganesh into a GPU-backed surface.
-//! - [`SkiaCpuRenderState`] replays through Skia's raster backend into any raster surface.
+//! - [`SkiaGpuRenderer`] renders through Skia Ganesh into a GPU-backed surface.
+//! - [`SkiaCpuTargetRenderer`] replays through Skia's raster backend into caller-provided CPU
+//!   targets.
 //! - [`SkiaCpuRenderer`] is the owned convenience wrapper for CPU raster rendering.
 //! - [`SkCanvasSink`] and [`SkPictureRecorderSink`] let you stream `imaging` commands directly into
 //!   native Skia targets instead of going through the owned renderers.
@@ -31,12 +32,12 @@
 //! [`SkiaCpuRenderer`] is the simpler choice when you just need pixels and do not need graphics API
 //! interop. It allocates a raster surface internally and returns RGBA8 output after replay.
 //!
-//! [`SkiaCpuRenderState`] is the lower-level CPU replay engine. It keeps reusable raster-side
+//! [`CommonRendererState`] is the lower-level CPU replay engine. It keeps reusable raster-side
 //! state such as path tolerance while callers provide the destination
-//! [`skia_safe::Surface`]. Use it when you want to render into caller-owned CPU memory via
-//! `wrap_pixels` or when a host application owns raster-surface allocation.
+//! [`skia_safe::Surface`]. [`SkiaCpuTargetRenderer`] is the corresponding `imaging_backend`
+//! wrapper when you want the same CPU replay path behind a named backend type.
 //!
-//! [`SkiaRenderer`] is the GPU path. It owns a Ganesh context and an offscreen GPU render surface
+//! [`SkiaGpuRenderer`] is the GPU path. It owns a Ganesh context and an offscreen GPU render surface
 //! by default, but it can also be pointed at caller-owned backend textures through the backend-
 //! specific constructors. Use it when you want GPU rendering, Skia backend texture access, or
 //! integration with an existing graphics stack.
@@ -61,19 +62,26 @@
 //! - you do not need GPU interop
 //! - deterministic CPU-side rendering is more important than backend integration
 //!
-//! Use [`SkiaCpuRenderState`] when:
+//! Use [`CommonRendererState`] when:
 //!
 //! - you want to render into a caller-owned raster surface
 //! - you want to reuse CPU-side caches across multiple wrapped surfaces
 //! - your application already manages pixel storage and surface lifetime
 //!
-//! Use [`SkiaRenderer::new`] or [`SkiaRenderer::try_new`] when:
+//! Use [`SkiaCpuTargetRenderer`] when:
+//!
+//! - you want the CPU renderer to implement `imaging_backend::Backend`
+//! - you want naming symmetry with [`SkiaCpuRenderer`], [`SkiaGpuRenderer`], and
+//!   [`SkiaGpuTargetRenderer`]
+//! - you still want access to reusable [`CommonRendererState`] through a thin wrapper
+//!
+//! Use [`SkiaGpuRenderer::new`] or [`SkiaGpuRenderer::try_new`] when:
 //!
 //! - you want an owned offscreen GPU renderer
 //! - `imaging_skia` should choose and own the underlying Ganesh backend
 //! - you want to render scenes or pictures and optionally inspect the GPU surface afterward
 //!
-//! Use the backend-specific `SkiaRenderer` constructors when:
+//! Use the backend-specific [`SkiaGpuTargetRenderer`] constructors when:
 //!
 //! - your application already owns the render target
 //! - Skia must draw into an existing Metal texture, Vulkan image, or GL texture
@@ -93,11 +101,11 @@
 //!
 //! # Render A Recorded Scene
 //!
-//! Record commands into [`imaging::record::Scene`], then hand the scene to [`SkiaRenderer`].
+//! Record commands into [`imaging::record::Scene`], then hand the scene to [`SkiaGpuRenderer`].
 //!
 //! ```no_run
 //! use imaging::{Painter, record};
-//! use imaging_skia::SkiaRenderer;
+//! use imaging_skia::SkiaGpuRenderer;
 //! use kurbo::Rect;
 //! use peniko::{Brush, Color};
 //!
@@ -110,7 +118,7 @@
 //!         painter.fill_rect(Rect::new(0.0, 0.0, 128.0, 128.0), &paint);
 //!     }
 //!
-//!     let mut renderer = SkiaRenderer::new(128, 128);
+//!     let mut renderer = SkiaGpuRenderer::new(128, 128);
 //!     renderer.reset()?;
 //!     renderer.render_scene(&scene)?;
 //!     let image = renderer.read_image()?;
@@ -122,11 +130,11 @@
 //! # Render Into Wrapped Pixels
 //!
 //! If you already own the destination pixels, wrap them in a raster surface and use
-//! [`SkiaCpuRenderState`].
+//! [`CommonRendererState`].
 //!
 //! ```no_run
 //! use imaging::{Painter, record};
-//! use imaging_skia::SkiaCpuRenderState;
+//! use imaging_skia::CommonRendererState;
 //! use kurbo::Rect;
 //! use peniko::{Brush, Color};
 //! use skia_safe as sk;
@@ -145,11 +153,11 @@
 //!         (128, 128),
 //!         sk::ColorType::RGBA8888,
 //!         sk::AlphaType::Premul,
-//!         None,
+//!         Some(sk::ColorSpace::new_srgb()),
 //!     );
 //!     let mut surface = sk::surfaces::wrap_pixels(&info, pixels.as_mut_slice(), Some(128 * 4), None)
 //!         .expect("wrap raster pixels");
-//!     let mut state = SkiaCpuRenderState::new();
+//!     let mut state = CommonRendererState::new();
 //!     state.render_scene(&mut surface, &scene)?;
 //!     Ok(())
 //! }
@@ -208,11 +216,11 @@
 //!
 //! # Render A Native `SkPicture`
 //!
-//! If you already have a recorded picture, hand it directly to [`SkiaRenderer`].
+//! If you already have a recorded picture, hand it directly to [`SkiaGpuRenderer`].
 //!
 //! ```no_run
 //! use imaging::Painter;
-//! use imaging_skia::{SkPictureRecorderSink, SkiaRenderer};
+//! use imaging_skia::{SkPictureRecorderSink, SkiaGpuRenderer};
 //! use kurbo::Rect;
 //! use peniko::{Brush, Color};
 //!
@@ -226,7 +234,7 @@
 //!     }
 //!
 //!     let picture = sink.finish_picture()?;
-//!     let mut renderer = SkiaRenderer::new(128, 128);
+//!     let mut renderer = SkiaGpuRenderer::new(128, 128);
 //!     renderer.reset()?;
 //!     renderer.render_picture(&picture)?;
 //!     let image = renderer.read_image()?;
@@ -252,15 +260,24 @@ mod vulkan;
 
 mod font_cache;
 mod ganesh;
+use core::convert::Infallible;
+use imaging::PaintSink;
 use imaging::{
-    BeginFrame, CpuBufferFormat, CpuBufferTarget, Filter, GeometryRef, PaintSink, RenderCore,
-    RenderOutput, Renderer, TargetRenderer,
+    Filter, GeometryRef,
     record::{Scene, ValidateError, replay},
 };
-use kurbo::{Affine, Shape as _};
+use imaging_backend::{
+    Backend as ImagingBackend, CpuBufferAlphaMode, CpuBufferChannelOrder, CpuBufferTarget,
+    RenderSource,
+};
+#[cfg(feature = "wgpu")]
+use imaging_backend::{GpuTextureTarget, RenderOutput};
+use kurbo::{Affine, Shape as _, Size};
 use peniko::color::{ColorSpaceTag, HueDirection, Srgb};
 use peniko::{BrushRef, ImageAlphaType, ImageFormat, ImageQuality, InterpolationAlphaSpace};
 use skia_safe as sk;
+#[cfg(feature = "wgpu")]
+use std::collections::HashSet;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::font_cache::skia_font_from_glyph_run;
@@ -341,21 +358,74 @@ pub enum Error {
     Internal(&'static str),
 }
 
-/// Ganesh renderer that executes `imaging` commands into a GPU-backed Skia surface.
+/// Reusable CPU raster replay state for Skia-backed rendering.
+///
+/// This type owns the persistent CPU-side caches and replay settings while callers provide the
+/// destination raster surface for each render.
 #[derive(Debug)]
-pub struct SkiaRenderer {
-    backend: GaneshBackend,
-    surface: sk::Surface,
+pub struct CommonRendererState {
     tolerance: f64,
-    image_cache: ImageCacheHandle,
     mask_cache: Rc<RefCell<MaskImageCache>>,
     retained_image_cache: Rc<RefCell<RetainedImageCache>>,
-    frame_active: bool,
+}
+
+impl Default for CommonRendererState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CommonRendererState {
+    /// Create reusable CPU raster replay state.
+    pub fn new() -> Self {
+        Self {
+            tolerance: 0.1,
+            mask_cache: Rc::new(RefCell::new(MaskImageCache::default())),
+            retained_image_cache: Rc::new(RefCell::new(RetainedImageCache::default())),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GpuRendererState {
+    backend: GaneshBackend,
+    common: CommonRendererState,
+    image_cache: ImageCacheHandle,
     #[cfg(feature = "wgpu")]
     wgpu_backend_keepalive: Option<WgpuDeviceQueueKeepalive>,
     #[cfg(feature = "wgpu")]
-    wgpu_target_keepalive: Option<WgpuTextureHandle>,
+    initialized_wgpu_targets: HashSet<u64>,
 }
+
+#[derive(Debug)]
+/// Generic Skia GPU renderer implementation parameterized by mode-specific storage.
+pub struct SkiaRendererImpl<M> {
+    state: GpuRendererState,
+    #[allow(
+        dead_code,
+        reason = "Mode-specific state is only exercised by some concrete renderer variants."
+    )]
+    mode: M,
+}
+
+/// Marker for the Skia GPU renderer variant that owns an internal offscreen target.
+#[derive(Debug)]
+pub struct CopyMode {
+    surface: sk::Surface,
+    #[cfg(feature = "wgpu")]
+    target_keepalive: Option<WgpuTextureHandle>,
+    #[cfg(feature = "wgpu")]
+    owned_wgpu_target_keepalive: Option<WgpuTextureHandle>,
+}
+
+/// Marker for the Skia GPU renderer variant that renders directly into caller-owned targets.
+#[derive(Debug, Default)]
+pub struct TargetMode;
+
+/// Owned GPU renderer that allocates and retains its own offscreen Skia target.
+pub type SkiaGpuRenderer = SkiaRendererImpl<CopyMode>;
+/// GPU renderer that binds caller-provided targets directly.
+pub type SkiaGpuTargetRenderer = SkiaRendererImpl<TargetMode>;
 
 #[cfg(feature = "wgpu")]
 #[derive(Debug)]
@@ -387,7 +457,68 @@ struct WgpuDeviceQueueKeepalive {
     queue: wgpu::Queue,
 }
 
-impl SkiaRenderer {
+impl<M> SkiaRendererImpl<M> {
+    fn from_backend_and_mode(backend: GaneshBackend, mode: M) -> Self {
+        Self {
+            state: GpuRendererState {
+                backend,
+                common: CommonRendererState::new(),
+                image_cache: Rc::new(RefCell::new(ImageCache::default())),
+                #[cfg(feature = "wgpu")]
+                wgpu_backend_keepalive: None,
+                #[cfg(feature = "wgpu")]
+                initialized_wgpu_targets: HashSet::new(),
+            },
+            mode,
+        }
+    }
+
+    /// Set the geometric flattening tolerance used for path conversion.
+    ///
+    /// Lower values preserve curve fidelity more aggressively; higher values can reduce path
+    /// complexity when rendering highly curved geometry.
+    pub fn set_tolerance(&mut self, tolerance: f64) {
+        self.state.common.tolerance = tolerance;
+        self.state.image_cache.borrow_mut().clear();
+        self.state.common.mask_cache.borrow_mut().clear();
+        self.state.common.retained_image_cache.borrow_mut().clear();
+    }
+
+    /// Drop any realized native mask images cached by the renderer.
+    pub fn clear_cached_masks(&mut self) {
+        self.state.image_cache.borrow_mut().clear();
+        self.state.common.mask_cache.borrow_mut().clear();
+        self.state.common.retained_image_cache.borrow_mut().clear();
+    }
+}
+
+impl SkiaGpuRenderer {
+    /// Build a renderer from an already-initialized Ganesh backend and wrapped target surface.
+    ///
+    /// Backend modules use this to share the same renderer initialization path without reaching
+    /// into `SkiaRenderer`'s private fields directly.
+    pub(crate) fn from_backend_surface(backend: GaneshBackend, surface: sk::Surface) -> Self {
+        Self::from_backend_and_mode(
+            backend,
+            CopyMode {
+                surface,
+                #[cfg(feature = "wgpu")]
+                target_keepalive: None,
+                #[cfg(feature = "wgpu")]
+                owned_wgpu_target_keepalive: None,
+            },
+        )
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl SkiaGpuTargetRenderer {
+    pub(crate) fn from_backend(backend: GaneshBackend) -> Self {
+        Self::from_backend_and_mode(backend, TargetMode)
+    }
+}
+
+impl SkiaGpuRenderer {
     /// Create an offscreen GPU renderer for a fixed output size.
     ///
     /// This is the convenience entry point for the common case where `imaging_skia` owns the GPU
@@ -407,72 +538,105 @@ impl SkiaRenderer {
         let surface = create_ganesh_surface(backend.direct_context(), width, height)?;
         Ok(Self::from_backend_surface(backend, surface))
     }
-
-    /// Build a renderer from an already-initialized Ganesh backend and wrapped target surface.
-    ///
-    /// Backend modules use this to share the same renderer initialization path without reaching
-    /// into `SkiaRenderer`'s private fields directly.
-    pub(crate) fn from_backend_surface(backend: GaneshBackend, surface: sk::Surface) -> Self {
-        Self {
-            backend,
-            surface,
-            tolerance: 0.1,
-            image_cache: Rc::new(RefCell::new(ImageCache::default())),
-            mask_cache: Rc::new(RefCell::new(MaskImageCache::default())),
-            retained_image_cache: Rc::new(RefCell::new(RetainedImageCache::default())),
-            frame_active: false,
-            #[cfg(feature = "wgpu")]
-            wgpu_backend_keepalive: None,
-            #[cfg(feature = "wgpu")]
-            wgpu_target_keepalive: None,
-        }
-    }
-
-    /// Set the geometric flattening tolerance used for path conversion.
-    ///
-    /// Lower values preserve curve fidelity more aggressively; higher values can reduce path
-    /// complexity when rendering highly curved geometry.
-    pub fn set_tolerance(&mut self, tolerance: f64) {
-        self.tolerance = tolerance;
-        self.clear_cached_masks();
-    }
-
-    /// Drop any realized native mask images cached by the renderer.
-    pub fn clear_cached_masks(&mut self) {
-        self.image_cache.borrow_mut().clear();
-        self.mask_cache.borrow_mut().clear();
-        self.retained_image_cache.borrow_mut().clear();
-    }
-
-    fn begin_frame(&mut self) {
-        if self.frame_active {
-            return;
-        }
-        self.retained_image_cache.borrow_mut().flip_mark();
-        self.frame_active = true;
-    }
-
-    fn finish_frame(&mut self) {
-        if !self.frame_active {
-            return;
-        }
-        self.retained_image_cache.borrow_mut().evict_unmarked();
-        self.frame_active = false;
-    }
-
-    #[cfg(feature = "wgpu")]
-    fn set_wgpu_backend_keepalive(&mut self, keepalive: WgpuDeviceQueueKeepalive) {
-        self.wgpu_backend_keepalive = Some(keepalive);
-    }
-
-    #[cfg(feature = "wgpu")]
-    fn set_wgpu_target_keepalive(&mut self, keepalive: WgpuTextureHandle) {
-        self.wgpu_target_keepalive = Some(keepalive);
-    }
 }
 
 #[cfg(feature = "wgpu")]
-impl SkiaRenderer {
+impl SkiaRendererImpl<CopyMode> {
+    fn try_new_from_wgpu_texture_impl(
+        texture_format: wgpu::TextureFormat,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: wgpu::Texture,
+    ) -> Result<Self, Error> {
+        let mut initialized_wgpu_targets = HashSet::new();
+        initialize_texture_for_wgpu_if_needed(
+            &mut initialized_wgpu_targets,
+            device,
+            queue,
+            &texture,
+        );
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let hal_device = unsafe {
+                device
+                    .as_hal::<wgpu::hal::api::Metal>()
+                    .ok_or(Error::CreateGpuContext("missing Metal device"))?
+            };
+            let hal_queue = unsafe {
+                queue
+                    .as_hal::<wgpu::hal::api::Metal>()
+                    .ok_or(Error::CreateGpuContext("missing Metal queue"))?
+            };
+            let raw_device = hal_device.raw_device().as_ptr() as *mut c_void;
+            let raw_command_queue = hal_queue.as_raw().lock().as_ptr() as *mut c_void;
+            let mut target_renderer = unsafe {
+                SkiaGpuTargetRenderer::try_new_metal_from_raw_pointers_without_texture(
+                    raw_device,
+                    raw_command_queue,
+                )
+            }?;
+            let (surface, texture_keepalive) =
+                target_renderer.create_wgpu_surface(texture_format, texture, device, queue)?;
+            let mut renderer =
+                SkiaGpuRenderer::from_backend_surface(target_renderer.state.backend, surface);
+            renderer.state.initialized_wgpu_targets = initialized_wgpu_targets;
+            renderer.state.wgpu_backend_keepalive = Some(WgpuDeviceQueueKeepalive {
+                device: device.clone(),
+                queue: queue.clone(),
+            });
+            renderer.mode.target_keepalive = Some(texture_keepalive);
+            return Ok(renderer);
+        }
+
+        #[cfg(all(feature = "vulkan", not(any(target_os = "macos", target_os = "ios"))))]
+        {
+            use ash::vk::Handle as _;
+
+            let hal_device = unsafe {
+                device
+                    .as_hal::<wgpu::hal::api::Vulkan>()
+                    .ok_or(Error::CreateGpuContext("missing Vulkan device"))?
+            };
+            let hal_queue = unsafe {
+                queue
+                    .as_hal::<wgpu::hal::api::Vulkan>()
+                    .ok_or(Error::CreateGpuContext("missing Vulkan queue"))?
+            };
+            let instance = hal_device.shared_instance().raw_instance().handle();
+            let physical_device = hal_device.raw_physical_device();
+            let raw_device = hal_device.raw_device().handle();
+            let raw_queue = hal_queue.as_raw();
+            let queue_family_index = hal_device.queue_family_index();
+            let mut target_renderer = unsafe {
+                SkiaGpuTargetRenderer::try_new_vulkan_from_raw_handles(
+                    instance,
+                    physical_device,
+                    raw_device,
+                    raw_queue,
+                    queue_family_index,
+                )
+            }?;
+            let (surface, texture_keepalive) =
+                target_renderer.create_wgpu_surface(texture_format, texture, device, queue)?;
+            let mut renderer =
+                SkiaGpuRenderer::from_backend_surface(target_renderer.state.backend, surface);
+            renderer.state.initialized_wgpu_targets = initialized_wgpu_targets;
+            renderer.state.wgpu_backend_keepalive = Some(WgpuDeviceQueueKeepalive {
+                device: device.clone(),
+                queue: queue.clone(),
+            });
+            renderer.mode.target_keepalive = Some(texture_keepalive);
+            return Ok(renderer);
+        }
+
+        #[allow(
+            unreachable_code,
+            unused_variables,
+            reason = "Platform and feature cfgs intentionally leave unsupported backend paths empty."
+        )]
+        Err(Error::UnsupportedGpuBackend)
+    }
+
     /// Create an offscreen renderer that shares the caller's `wgpu` device and queue.
     ///
     /// Unlike [`Self::try_new_from_wgpu_texture`], this path does not wrap a caller-owned texture.
@@ -485,97 +649,70 @@ impl SkiaRenderer {
         height: u16,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        texture_format: wgpu::TextureFormat,
     ) -> Result<Self, Error> {
-        #[allow(
-            unused_variables,
-            reason = "Platform cfgs may compile out all interop branches."
-        )]
-        let keepalive = WgpuDeviceQueueKeepalive {
-            device: device.clone(),
-            queue: queue.clone(),
-        };
-
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            let device = unsafe {
-                device
-                    .as_hal::<wgpu::hal::api::Metal>()
-                    .ok_or(Error::CreateGpuContext("missing Metal device"))?
-            };
-            let queue = unsafe {
-                queue
-                    .as_hal::<wgpu::hal::api::Metal>()
-                    .ok_or(Error::CreateGpuContext("missing Metal queue"))?
-            };
-            let device = device.raw_device().as_ptr() as *mut c_void;
-            let command_queue = queue.as_raw().lock().as_ptr() as *mut c_void;
-            let mut renderer = unsafe {
-                Self::try_new_metal_from_raw_pointers_without_texture(
-                    width,
-                    height,
-                    device,
-                    command_queue,
-                )
-            }?;
-            renderer.set_wgpu_backend_keepalive(keepalive);
-            return Ok(renderer);
-        }
-
-        #[cfg(all(feature = "vulkan", not(any(target_os = "macos", target_os = "ios"))))]
-        {
-            use ash::vk::Handle as _;
-
-            let device = unsafe {
-                device
-                    .as_hal::<wgpu::hal::api::Vulkan>()
-                    .ok_or(Error::CreateGpuContext("missing Vulkan device"))?
-            };
-            let queue = unsafe {
-                queue
-                    .as_hal::<wgpu::hal::api::Vulkan>()
-                    .ok_or(Error::CreateGpuContext("missing Vulkan queue"))?
-            };
-            let instance = device.shared_instance().raw_instance().handle();
-            let physical_device = device.raw_physical_device();
-            let raw_device = device.raw_device().handle();
-            let raw_queue = queue.as_raw();
-            let queue_family_index = device.queue_family_index();
-            let mut renderer = unsafe {
-                Self::try_new_vulkan_from_raw_handles(
-                    width,
-                    height,
-                    instance,
-                    physical_device,
-                    raw_device,
-                    raw_queue,
-                    queue_family_index,
-                )
-            }?;
-            renderer.set_wgpu_backend_keepalive(keepalive);
-            return Ok(renderer);
-        }
-
-        #[allow(
-            unreachable_code,
-            unused_variables,
-            reason = "Platform and feature cfgs intentionally leave unsupported backend paths empty."
-        )]
-        Err(Error::UnsupportedGpuBackend)
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imaging_skia owned copy target"),
+            size: wgpu::Extent3d {
+                width: u32::from(width).max(1),
+                height: u32::from(height).max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: texture_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[texture_format],
+        });
+        let mut renderer =
+            Self::try_new_from_wgpu_owned_texture(texture_format, device, queue, texture)?;
+        renderer.mode.owned_wgpu_target_keepalive =
+            renderer
+                .mode
+                .target_keepalive
+                .as_ref()
+                .map(|target| WgpuTextureHandle {
+                    texture: target.texture.clone(),
+                    view: target.view.clone(),
+                });
+        Ok(renderer)
     }
 
-    /// Create a renderer that targets an owned `wgpu` texture.
+    /// Create an offscreen renderer around a caller-supplied `wgpu` texture that this renderer
+    /// then owns and reuses internally.
     ///
-    /// This is the high-level interop entry point when the caller already works in `wgpu` terms and
-    /// wants `imaging_skia` to attach to that device/queue/texture tuple while taking ownership of
-    /// the render target handle. Use [`Self::try_new_from_wgpu_device`] instead when you only want
-    /// to share the backend and let `imaging_skia` allocate its own offscreen target surface.
-    pub fn try_new_from_wgpu_texture(
+    /// This is still the owned/copy renderer path. Use
+    /// [`SkiaGpuTargetRenderer::try_new_from_wgpu_texture`] when you want direct rendering into a
+    /// caller-managed texture instead of an internally owned offscreen target.
+    pub fn try_new_from_wgpu_owned_texture(
         texture_format: wgpu::TextureFormat,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         texture: wgpu::Texture,
     ) -> Result<Self, Error> {
-        initialize_texture_for_wgpu(device, queue, &texture);
+        Self::try_new_from_wgpu_texture_impl(texture_format, device, queue, texture)
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl<M> SkiaRendererImpl<M> {
+    fn create_wgpu_surface(
+        &mut self,
+        texture_format: wgpu::TextureFormat,
+        texture: wgpu::Texture,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(sk::Surface, WgpuTextureHandle), Error> {
+        initialize_texture_for_wgpu_if_needed(
+            &mut self.state.initialized_wgpu_targets,
+            device,
+            queue,
+            &texture,
+        );
         let texture_keepalive = WgpuTextureHandle::new(texture);
         let texture_size = texture_keepalive.texture.size();
         let width = u16::try_from(texture_size.width)
@@ -585,93 +722,44 @@ impl SkiaRenderer {
 
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
-            let hal_device = unsafe {
-                device
-                    .as_hal::<wgpu::hal::api::Metal>()
-                    .ok_or(Error::CreateGpuContext("missing Metal device"))?
-            };
-            let hal_queue = unsafe {
-                queue
-                    .as_hal::<wgpu::hal::api::Metal>()
-                    .ok_or(Error::CreateGpuContext("missing Metal queue"))?
-            };
             let texture = unsafe {
                 texture_keepalive
                     .texture
                     .as_hal::<wgpu::hal::api::Metal>()
                     .ok_or(Error::CreateGpuSurface)?
             };
-            let raw_device = hal_device.raw_device().as_ptr() as *mut c_void;
-            let raw_command_queue = hal_queue.as_raw().lock().as_ptr() as *mut c_void;
             let texture = unsafe { texture.raw_handle() }.as_ptr() as *mut c_void;
-            let mut renderer = unsafe {
-                Self::try_new_metal_from_raw_pointers(
-                    width,
-                    height,
-                    texture_format,
-                    raw_device,
-                    raw_command_queue,
-                    texture,
-                )
-            }?;
-            renderer.set_wgpu_backend_keepalive(WgpuDeviceQueueKeepalive {
-                device: device.clone(),
-                queue: queue.clone(),
-            });
-            renderer.set_wgpu_target_keepalive(texture_keepalive);
-            return Ok(renderer);
+            let surface =
+                unsafe { self.create_metal_surface_raw(width, height, texture_format, texture) }?;
+            return Ok((surface, texture_keepalive));
         }
 
         #[cfg(all(feature = "vulkan", not(any(target_os = "macos", target_os = "ios"))))]
         {
-            use ash::vk::Handle as _;
-
-            let hal_device = unsafe {
-                device
-                    .as_hal::<wgpu::hal::api::Vulkan>()
-                    .ok_or(Error::CreateGpuContext("missing Vulkan device"))?
-            };
-            let hal_queue = unsafe {
-                queue
-                    .as_hal::<wgpu::hal::api::Vulkan>()
-                    .ok_or(Error::CreateGpuContext("missing Vulkan queue"))?
-            };
             let texture = unsafe {
                 texture_keepalive
                     .texture
                     .as_hal::<wgpu::hal::api::Vulkan>()
                     .ok_or(Error::CreateGpuSurface)?
             };
-            let instance = hal_device.shared_instance().raw_instance().handle();
-            let physical_device = hal_device.raw_physical_device();
-            let raw_device = hal_device.raw_device().handle();
-            let raw_queue = hal_queue.as_raw();
-            let queue_family_index = hal_device.queue_family_index();
             let raw_image = unsafe { texture.raw_handle() };
-            let image_layout = ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-            let image_usage_flags = ash::vk::ImageUsageFlags::COLOR_ATTACHMENT;
-            let mut renderer = unsafe {
-                Self::try_new_vulkan_from_raw_handles_and_texture(
+            let queue_family_index = match &self.state.backend {
+                GaneshBackend::Vulkan(backend) => backend.queue_family_index(),
+                _ => sk::gpu::vk::QUEUE_FAMILY_IGNORED,
+            };
+            let surface = unsafe {
+                self.create_vulkan_surface(
                     width,
                     height,
                     texture_format,
-                    instance,
-                    physical_device,
-                    raw_device,
-                    raw_queue,
-                    queue_family_index,
                     raw_image,
-                    image_layout,
-                    image_usage_flags,
+                    ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    ash::vk::ImageUsageFlags::COLOR_ATTACHMENT,
                     1,
+                    queue_family_index,
                 )
             }?;
-            renderer.set_wgpu_backend_keepalive(WgpuDeviceQueueKeepalive {
-                device: device.clone(),
-                queue: queue.clone(),
-            });
-            renderer.set_wgpu_target_keepalive(texture_keepalive);
-            return Ok(renderer);
+            return Ok((surface, texture_keepalive));
         }
 
         #[allow(
@@ -684,67 +772,68 @@ impl SkiaRenderer {
 }
 
 #[cfg(feature = "wgpu")]
-impl SkiaRenderer {
-    /// Retarget the renderer to a different owned `wgpu` texture on the same backend bridge.
-    ///
-    /// This is the `wgpu`-level companion to the explicit Metal and Vulkan replacement methods and
-    /// is intended for integrations that manage resize or swapchain churn entirely through `wgpu`.
-    pub fn replace_wgpu_texture(
-        &mut self,
-        texture_format: wgpu::TextureFormat,
-        texture: wgpu::Texture,
+impl SkiaGpuTargetRenderer {
+    /// Create a renderer that shares the caller's `wgpu` backend for later target binding.
+    pub fn try_new_from_wgpu_device(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-    ) -> Result<(), Error> {
-        initialize_texture_for_wgpu(device, queue, &texture);
-        let texture_keepalive = WgpuTextureHandle::new(texture);
-        let texture_size = texture_keepalive.texture.size();
-        let width = u16::try_from(texture_size.width)
-            .map_err(|_| Error::Internal("texture width exceeds skia limit"))?;
-        let height = u16::try_from(texture_size.height)
-            .map_err(|_| Error::Internal("texture height exceeds skia limit"))?;
-
+    ) -> Result<Self, Error> {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
-            let texture = unsafe {
-                texture_keepalive
-                    .texture
+            let hal_device = unsafe {
+                device
                     .as_hal::<wgpu::hal::api::Metal>()
-                    .ok_or(Error::CreateGpuSurface)?
+                    .ok_or(Error::CreateGpuContext("missing Metal device"))?
             };
-            let texture = unsafe { texture.raw_handle() }.as_ptr() as *mut c_void;
-            unsafe { self.replace_metal_texture_raw(width, height, texture_format, texture) }?;
-            self.set_wgpu_target_keepalive(texture_keepalive);
-            return Ok(());
+            let hal_queue = unsafe {
+                queue
+                    .as_hal::<wgpu::hal::api::Metal>()
+                    .ok_or(Error::CreateGpuContext("missing Metal queue"))?
+            };
+            let raw_device = hal_device.raw_device().as_ptr() as *mut c_void;
+            let raw_command_queue = hal_queue.as_raw().lock().as_ptr() as *mut c_void;
+            let mut renderer = unsafe {
+                Self::try_new_metal_from_raw_pointers_without_texture(raw_device, raw_command_queue)
+            }?;
+            renderer.state.wgpu_backend_keepalive = Some(WgpuDeviceQueueKeepalive {
+                device: device.clone(),
+                queue: queue.clone(),
+            });
+            return Ok(renderer);
         }
 
         #[cfg(all(feature = "vulkan", not(any(target_os = "macos", target_os = "ios"))))]
         {
-            let texture = unsafe {
-                texture_keepalive
-                    .texture
+            use ash::vk::Handle as _;
+            let hal_device = unsafe {
+                device
                     .as_hal::<wgpu::hal::api::Vulkan>()
-                    .ok_or(Error::CreateGpuSurface)?
+                    .ok_or(Error::CreateGpuContext("missing Vulkan device"))?
             };
-            let raw_image = unsafe { texture.raw_handle() };
-            let queue_family_index = match &self.backend {
-                GaneshBackend::Vulkan(backend) => backend.queue_family_index(),
-                _ => sk::gpu::vk::QUEUE_FAMILY_IGNORED,
+            let hal_queue = unsafe {
+                queue
+                    .as_hal::<wgpu::hal::api::Vulkan>()
+                    .ok_or(Error::CreateGpuContext("missing Vulkan queue"))?
             };
-            unsafe {
-                self.replace_vulkan_texture(
-                    width,
-                    height,
-                    texture_format,
-                    raw_image,
-                    ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    ash::vk::ImageUsageFlags::COLOR_ATTACHMENT,
-                    1,
+            let instance = hal_device.shared_instance().raw_instance().handle();
+            let physical_device = hal_device.raw_physical_device();
+            let raw_device = hal_device.raw_device().handle();
+            let raw_queue = hal_queue.as_raw();
+            let queue_family_index = hal_device.queue_family_index();
+            let mut renderer = unsafe {
+                Self::try_new_vulkan_from_raw_handles(
+                    instance,
+                    physical_device,
+                    raw_device,
+                    raw_queue,
                     queue_family_index,
                 )
             }?;
-            self.set_wgpu_target_keepalive(texture_keepalive);
-            return Ok(());
+            renderer.state.wgpu_backend_keepalive = Some(WgpuDeviceQueueKeepalive {
+                device: device.clone(),
+                queue: queue.clone(),
+            });
+            return Ok(renderer);
         }
 
         #[allow(
@@ -755,144 +844,201 @@ impl SkiaRenderer {
         Err(Error::UnsupportedGpuBackend)
     }
 
-    /// Borrow the live owned `wgpu` texture when the renderer is targeting one.
-    pub fn wgpu_texture(&self) -> Option<&wgpu::Texture> {
-        self.wgpu_target_keepalive
-            .as_ref()
-            .map(|target| &target.texture)
-    }
-
-    /// Borrow the live `wgpu::TextureView` for the currently owned texture.
-    pub fn wgpu_texture_view(&self) -> Option<&wgpu::TextureView> {
-        self.wgpu_target_keepalive
-            .as_ref()
-            .map(|target| &target.view)
+    /// Backward-compatible constructor that ignores the initial texture until render time.
+    pub fn try_new_from_wgpu_texture(
+        _texture_format: wgpu::TextureFormat,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _texture: wgpu::Texture,
+    ) -> Result<Self, Error> {
+        Self::try_new_from_wgpu_device(device, queue)
     }
 }
 
-impl SkiaRenderer {
-    /// Reset canvas state before starting a new frame on the wrapped GPU surface.
-    ///
-    /// Rendering methods call this internally so each frame starts from a known transform, clip,
-    /// and clear state regardless of what the previous frame left behind.
-    pub fn reset(&mut self) -> Result<(), Error> {
+impl GpuRendererState {
+    fn begin_frame(&mut self) -> Result<(), Error> {
         self.backend.ensure_current()?;
-        self.finish_frame();
-        let canvas = self.surface.canvas();
+        self.common.retained_image_cache.borrow_mut().flip_mark();
+        Ok(())
+    }
+
+    fn reset_surface(&mut self, surface: &mut sk::Surface) -> Result<(), Error> {
+        let canvas = surface.canvas();
         canvas.restore_to_count(1);
         canvas.reset_matrix();
         canvas.clear(sk::Color::TRANSPARENT);
         Ok(())
     }
 
-    fn canvas_sink(&mut self) -> SkCanvasSink<'_> {
+    fn canvas_sink<'a>(&'a mut self, surface: &'a mut sk::Surface) -> SkCanvasSink<'a> {
         let mut sink = SkCanvasSink::new_with_mask_cache(
-            self.surface.canvas(),
+            surface.canvas(),
             Some(Rc::clone(&self.image_cache)),
-            Rc::clone(&self.mask_cache),
-            Rc::clone(&self.retained_image_cache),
+            Rc::clone(&self.common.mask_cache),
+            Rc::clone(&self.common.retained_image_cache),
         );
-        sink.set_tolerance(self.tolerance);
+        sink.set_tolerance(self.common.tolerance);
         sink
     }
 
-    fn flush(&mut self) {
-        self.backend.flush_surface(&mut self.surface);
+    fn with_canvas_sink_on_surface<R>(
+        &mut self,
+        surface: &mut sk::Surface,
+        f: impl FnOnce(&mut SkCanvasSink<'_>) -> R,
+    ) -> Result<R, Error> {
+        let mut sink = self.canvas_sink(surface);
+        let out = f(&mut sink);
+        let finish_result = sink.finish();
+        finish_result?;
+        Ok(out)
+    }
+
+    fn render_scene_on_surface(
+        &mut self,
+        surface: &mut sk::Surface,
+        scene: &Scene,
+    ) -> Result<(), Error> {
+        scene.validate().map_err(Error::InvalidScene)?;
+        let mut sink = self.canvas_sink(surface);
+        replay(scene, &mut sink);
+        let finish_result = sink.finish();
+        finish_result?;
+        Ok(())
+    }
+
+    fn render_picture_on_surface(
+        &mut self,
+        surface: &mut sk::Surface,
+        picture: &sk::Picture,
+    ) -> Result<(), Error> {
+        surface.canvas().draw_picture(picture, None, None);
+        Ok(())
+    }
+}
+
+impl SkiaGpuRenderer {
+    #[cfg_attr(
+        not(feature = "wgpu"),
+        allow(dead_code, reason = "This shared GPU helper is currently exercised by wgpu paths.")
+    )]
+    fn with_paint_sink(&mut self, f: &mut dyn FnMut(&mut dyn PaintSink)) {
+        self.state
+            .with_canvas_sink_on_surface(&mut self.mode.surface, |sink| f(sink))
+            .expect("render into imaging_skia gpu canvas sink");
+    }
+
+    #[cfg_attr(
+        not(feature = "wgpu"),
+        allow(dead_code, reason = "This shared GPU helper is currently exercised by wgpu paths.")
+    )]
+    fn finish(&mut self) {
+        self.state
+            .common
+            .retained_image_cache
+            .borrow_mut()
+            .evict_unmarked();
+        self.state
+            .backend
+            .ensure_current()
+            .expect("make imaging_skia gpu backend current");
+        self.state.backend.flush_surface(&mut self.mode.surface);
+    }
+
+    #[cfg_attr(
+        not(feature = "wgpu"),
+        allow(dead_code, reason = "This shared GPU helper is currently exercised by wgpu paths.")
+    )]
+    fn reset_for_frame(&mut self) {
+        Self::reset(self).expect("reset imaging_skia renderer");
+    }
+
+    /// Reset canvas state on the wrapped GPU surface before issuing new draw commands.
+    ///
+    /// This clears the surface to transparent, restores the canvas stack to its root save level,
+    /// and resets the current transform. This method does not begin or finish a frame on its own;
+    /// backend entry points and higher-level render helpers are responsible for frame ownership.
+    ///
+    /// Call this when you intentionally want to discard previous contents before a top-level render
+    /// pass. Do not call it after you have started issuing commands for the frame you want to keep.
+    pub fn reset(&mut self) -> Result<(), Error> {
+        self.state.reset_surface(&mut self.mode.surface)
     }
 
     /// Stream `imaging` commands directly into the current GPU surface.
     ///
-    /// This is the low-level sink-oriented API for callers that want to drive Skia directly
-    /// without first building an intermediate `Scene`.
+    /// This is a low-level replay helper. It records into the bound surface but does not reset the
+    /// canvas, begin a frame, or flush/present work on its own. Callers that use it directly are
+    /// responsible for surface preparation and frame boundaries.
     pub fn with_canvas_sink<R>(
         &mut self,
         f: impl FnOnce(&mut SkCanvasSink<'_>) -> R,
     ) -> Result<R, Error> {
-        self.backend.ensure_current()?;
-        self.begin_frame();
-        let mut sink = self.canvas_sink();
-        let out = f(&mut sink);
-        let finish_result = sink.finish();
-        finish_result?;
-        self.flush();
-        Ok(out)
+        self.state
+            .with_canvas_sink_on_surface(&mut self.mode.surface, f)
     }
 
     /// Replay an `imaging` scene into the current GPU surface.
     ///
-    /// This is the main path for rendering the semantic `imaging::record::Scene` representation
-    /// through Skia/Ganesh.
+    /// This validates and records the scene into the current surface but does not reset the
+    /// surface, begin a frame, or flush the backend by itself. Use this after explicit frame
+    /// setup when composing custom render flows.
     pub fn render_scene(&mut self, scene: &Scene) -> Result<(), Error> {
-        scene.validate().map_err(Error::InvalidScene)?;
-        self.backend.ensure_current()?;
-        self.begin_frame();
-        let mut sink = self.canvas_sink();
-        replay(scene, &mut sink);
-        let finish_result = sink.finish();
-        finish_result?;
-        self.flush();
-        Ok(())
+        self.state
+            .render_scene_on_surface(&mut self.mode.surface, scene)
     }
 
     /// Draw an existing native Skia picture into the current GPU surface.
     ///
-    /// This is useful when higher layers already hold a recorded `SkPicture` and want to reuse the
-    /// same renderer and readback path as scene-based rendering.
+    /// Like [`Self::render_scene`], this is a low-level draw helper. It does not reset the
+    /// destination or finalize the frame for you.
     pub fn render_picture(&mut self, picture: &sk::Picture) -> Result<(), Error> {
-        self.backend.ensure_current()?;
-        self.begin_frame();
-        self.surface.canvas().draw_picture(picture, None, None);
-        self.flush();
-        Ok(())
+        self.state
+            .render_picture_on_surface(&mut self.mode.surface, picture)
     }
 
     /// Borrow the live GPU-backed `skia_safe::Surface`.
-    ///
-    /// Use this when you need direct Skia drawing access instead of going through scene replay.
     pub fn surface(&mut self) -> &mut sk::Surface {
-        &mut self.surface
+        &mut self.mode.surface
     }
 
     /// Snapshot the current GPU surface as a Skia image.
-    ///
-    /// This flushes pending work first so the returned image reflects the renderer's latest output.
     pub fn image_snapshot(&mut self) -> sk::Image {
-        let _ = self.backend.ensure_current();
-        self.flush();
-        self.surface.image_snapshot()
+        let _ = self.state.backend.ensure_current();
+        self.state.backend.flush_surface(&mut self.mode.surface);
+        self.mode.surface.image_snapshot()
     }
 
     /// Expose Skia's backend texture for the current surface when the backend supports it.
-    ///
-    /// This is primarily for advanced interop or inspection code that needs the underlying Ganesh
-    /// texture handle after rendering.
     pub fn backend_texture(&mut self) -> Option<sk::gpu::BackendTexture> {
-        let _ = self.backend.ensure_current();
-        self.flush();
+        let _ = self.state.backend.ensure_current();
+        self.state.backend.flush_surface(&mut self.mode.surface);
         sk::gpu::surfaces::get_backend_texture(
-            &mut self.surface,
+            &mut self.mode.surface,
             sk::surface::BackendHandleAccess::FlushRead,
         )
     }
 
-    /// Read back the current GPU surface into an unpremultiplied RGBA8 image.
+    /// Read back the current GPU surface into an unpremultiplied sRGB RGBA8 image.
     ///
     /// Rendering methods funnel through this helper after flushing work to the active backend.
     pub fn read_image(&mut self) -> Result<peniko::ImageData, Error> {
-        self.backend.ensure_current()?;
-        self.flush();
+        self.state.backend.ensure_current()?;
+        self.state.backend.flush_surface(&mut self.mode.surface);
         let info = sk::ImageInfo::new(
-            (self.surface.width(), self.surface.height()),
+            (self.mode.surface.width(), self.mode.surface.height()),
             sk::ColorType::RGBA8888,
             sk::AlphaType::Unpremul,
             None,
         );
         let mut bytes =
-            vec![0_u8; (self.surface.width() as usize) * (self.surface.height() as usize) * 4];
-        let ok = self.surface.read_pixels(
+            vec![
+                0_u8;
+                (self.mode.surface.width() as usize) * (self.mode.surface.height() as usize) * 4
+            ];
+        let ok = self.mode.surface.read_pixels(
             &info,
             bytes.as_mut_slice(),
-            (4 * self.surface.width()) as usize,
+            (4 * self.mode.surface.width()) as usize,
             (0, 0),
         );
         if !ok {
@@ -901,57 +1047,266 @@ impl SkiaRenderer {
         Ok(peniko::ImageData {
             data: peniko::Blob::new(Arc::new(bytes)),
             format: ImageFormat::Rgba8,
-            width: self.surface.width() as u32,
-            height: self.surface.height() as u32,
+            width: self.mode.surface.width() as u32,
+            height: self.mode.surface.height() as u32,
             alpha_type: ImageAlphaType::Alpha,
         })
     }
 }
 
-impl RenderCore for SkiaRenderer {
-    fn render(&mut self, f: &mut dyn FnMut(&mut dyn PaintSink)) {
-        self.with_canvas_sink(|sink| f(sink))
-            .expect("render into imaging_skia gpu canvas sink");
+#[cfg(feature = "wgpu")]
+impl SkiaGpuRenderer {
+    /// Borrow the live owned `wgpu` texture when the renderer is targeting one.
+    pub fn wgpu_texture(&self) -> Option<&wgpu::Texture> {
+        self.mode
+            .target_keepalive
+            .as_ref()
+            .map(|target| &target.texture)
     }
 
-    fn finish(&mut self) {
-        self.finish_frame();
-        self.backend
-            .ensure_current()
-            .expect("make imaging_skia gpu backend current");
-        self.flush();
+    /// Borrow the live `wgpu::TextureView` for the currently owned texture.
+    pub fn wgpu_texture_view(&self) -> Option<&wgpu::TextureView> {
+        self.mode
+            .target_keepalive
+            .as_ref()
+            .map(|target| &target.view)
     }
-
-    fn readback(&mut self) -> Option<RenderOutput> {
-        self.read_image().ok().map(RenderOutput::Image)
-    }
-
-    fn debug_info(&self) -> String {
-        "name: Skia\ninfo: imaging_skia::SkiaRenderer".to_string()
-    }
-}
-
-impl Renderer for SkiaRenderer {
-    type Target = peniko::ImageData;
 
     #[allow(
         clippy::cast_possible_truncation,
         reason = "Frame sizes are converted to whole pixels and then checked against `u16`."
     )]
-    fn set_size(&mut self, frame: BeginFrame) {
-        let width = u16::try_from(frame.size.width as u32).expect("skia width out of range");
-        let height = u16::try_from(frame.size.height as u32).expect("skia height out of range");
-        if self.surface.width() != i32::from(width) || self.surface.height() != i32::from(height) {
-            *self = Self::try_new(width, height).expect("recreate imaging_skia renderer");
+    fn set_size(&mut self, size: Size) {
+        let width = u16::try_from(size.width as u32).expect("skia width out of range");
+        let height = u16::try_from(size.height as u32).expect("skia height out of range");
+        let surface = &mut self.mode.surface;
+        if surface.width() != i32::from(width) || surface.height() != i32::from(height) {
+            let keepalive = self
+                .state
+                .wgpu_backend_keepalive
+                .as_ref()
+                .expect("copy skia renderer keeps wgpu backend alive");
+            let texture_format = self
+                .mode
+                .owned_wgpu_target_keepalive
+                .as_ref()
+                .expect("copy skia renderer owns a wgpu target")
+                .texture
+                .format();
+            *self = Self::try_new_from_wgpu_device(
+                width,
+                height,
+                &keepalive.device,
+                &keepalive.queue,
+                texture_format,
+            )
+            .expect("recreate imaging_skia copy renderer");
         }
     }
+}
 
-    fn reset(&mut self) {
-        Self::reset(self).expect("reset imaging_skia renderer");
+#[cfg(feature = "wgpu")]
+impl SkiaGpuTargetRenderer {
+    fn render_target(
+        &mut self,
+        size: Size,
+        source: &mut dyn RenderSource,
+        target: GpuTextureTarget,
+    ) -> Result<(), String> {
+        let device = target.device;
+        let queue = target.queue;
+        let texture = target.texture_view.texture().clone();
+        let texture_format = texture.format();
+        let mut surface = self
+            .create_wgpu_surface(texture_format, texture, &device, &queue)
+            .map_err(|err| format!("{err:?}"))?
+            .0;
+        let width = size.width as i32;
+        let height = size.height as i32;
+        if surface.width() != width || surface.height() != height {
+            return Err("skia target size must match bound texture size".to_string());
+        }
+        self.state.begin_frame().map_err(|err| format!("{err:?}"))?;
+        self.state
+            .reset_surface(&mut surface)
+            .map_err(|err| format!("{err:?}"))?;
+        self.state
+            .with_canvas_sink_on_surface(&mut surface, |sink| source.paint_into(sink))
+            .map_err(|err| format!("{err:?}"))?;
+        self.state
+            .common
+            .retained_image_cache
+            .borrow_mut()
+            .evict_unmarked();
+        self.state
+            .backend
+            .ensure_current()
+            .map_err(|err| format!("{err:?}"))?;
+        self.state.backend.flush_surface(&mut surface);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl ImagingBackend for SkiaGpuTargetRenderer {
+    type Error = String;
+    type Image = peniko::ImageData;
+    type BufferTarget<'a> = Infallible;
+    type TextureTarget<'a> = GpuTextureTarget;
+
+    fn render_to_buffer<'a>(
+        &mut self,
+        _size: Size,
+        _source: &mut dyn RenderSource,
+        target: Self::BufferTarget<'a>,
+    ) -> Result<(), Self::Error> {
+        match target {}
     }
 
-    fn read_target(&mut self) -> Option<Self::Target> {
-        self.read_image().ok()
+    fn render_to_texture<'a>(
+        &mut self,
+        size: Size,
+        source: &mut dyn RenderSource,
+        target: Self::TextureTarget<'a>,
+    ) -> Result<(), Self::Error> {
+        self.render_target(size, source, target)
+    }
+
+    fn render_to_image(
+        &mut self,
+        size: Size,
+        source: &mut dyn RenderSource,
+        width: u32,
+        height: u32,
+    ) -> Result<Self::Image, Self::Error> {
+        let keepalive = self.state.wgpu_backend_keepalive.as_ref().ok_or_else(|| {
+            "direct skia target renderer requires wgpu backend for capture".to_string()
+        })?;
+        let device = keepalive.device.clone();
+        let queue = keepalive.queue.clone();
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imaging_skia direct target capture"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.render_target(
+            size,
+            source,
+            GpuTextureTarget {
+                device: device.clone(),
+                queue: queue.clone(),
+                texture_view: texture_view.clone(),
+            },
+        )?;
+        RenderOutput::GpuTexture(texture_view)
+            .into_image_with(&device, &queue)
+            .ok_or_else(|| "direct skia target renderer capture readback failed".to_string())
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl SkiaGpuRenderer {
+    fn render_copy_to_texture(
+        &mut self,
+        size: Size,
+        source: &mut dyn RenderSource,
+        target: GpuTextureTarget,
+    ) -> Result<(), String> {
+        let owned_texture = self
+            .mode
+            .owned_wgpu_target_keepalive
+            .as_ref()
+            .ok_or_else(|| "copy skia renderer owns no internal target".to_string())?
+            .texture
+            .clone();
+        let owned_format = owned_texture.format();
+        let device = target.device;
+        let queue = target.queue;
+        let target_texture = target.texture_view.texture().clone();
+        let target_format = target_texture.format();
+
+        self.set_size(size);
+        self.state.begin_frame().map_err(|err| format!("{err:?}"))?;
+        self.reset_for_frame();
+        self.with_paint_sink(&mut |sink| source.paint_into(sink));
+        self.finish();
+        let snapshot = self.image_snapshot();
+        let mut target_surface = self
+            .create_wgpu_surface(target_format, target_texture, &device, &queue)
+            .map_err(|err| format!("{err:?}"))?
+            .0;
+        self.state
+            .reset_surface(&mut target_surface)
+            .map_err(|err| format!("{err:?}"))?;
+        target_surface.canvas().draw_image(&snapshot, (0, 0), None);
+        self.state
+            .common
+            .retained_image_cache
+            .borrow_mut()
+            .evict_unmarked();
+        self.state
+            .backend
+            .ensure_current()
+            .map_err(|err| format!("{err:?}"))?;
+        self.state.backend.flush_surface(&mut target_surface);
+
+        let (_, target_keepalive) = self
+            .create_wgpu_surface(owned_format, owned_texture, &device, &queue)
+            .map_err(|err| format!("{err:?}"))?;
+        self.mode.target_keepalive = Some(target_keepalive);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl ImagingBackend for SkiaGpuRenderer {
+    type Error = String;
+    type Image = peniko::ImageData;
+    type BufferTarget<'a> = Infallible;
+    type TextureTarget<'a> = GpuTextureTarget;
+
+    fn render_to_buffer<'a>(
+        &mut self,
+        _size: Size,
+        _source: &mut dyn RenderSource,
+        _target: Self::BufferTarget<'a>,
+    ) -> Result<(), Self::Error> {
+        unreachable!()
+    }
+
+    fn render_to_texture<'a>(
+        &mut self,
+        size: Size,
+        source: &mut dyn RenderSource,
+        target: Self::TextureTarget<'a>,
+    ) -> Result<(), Self::Error> {
+        self.render_copy_to_texture(size, source, target)
+    }
+
+    fn render_to_image(
+        &mut self,
+        _size: Size,
+        source: &mut dyn RenderSource,
+        width: u32,
+        height: u32,
+    ) -> Result<Self::Image, Self::Error> {
+        self.set_size(Size::new(width as f64, height as f64));
+        self.reset_for_frame();
+        self.with_paint_sink(&mut |sink| source.paint_into(sink));
+        self.finish();
+        self.read_image().map_err(|err| format!("{err:?}"))
     }
 }
 
@@ -959,68 +1314,23 @@ impl Renderer for SkiaRenderer {
 ///
 /// This type keeps renderer-side state such as tolerance while callers provide the destination
 /// raster surface for each render.
-#[derive(Debug)]
-pub struct SkiaCpuRenderState {
-    tolerance: f64,
-    mask_cache: Rc<RefCell<MaskImageCache>>,
-    retained_image_cache: Rc<RefCell<RetainedImageCache>>,
-    frame_active: bool,
-}
 
-impl Default for SkiaCpuRenderState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SkiaCpuRenderState {
-    /// Create reusable CPU raster replay state.
-    pub fn new() -> Self {
-        Self {
-            tolerance: 0.1,
-            mask_cache: Rc::new(RefCell::new(MaskImageCache::default())),
-            retained_image_cache: Rc::new(RefCell::new(RetainedImageCache::default())),
-            frame_active: false,
-        }
-    }
-
-    /// Set the geometric flattening tolerance used for path conversion.
-    pub fn set_tolerance(&mut self, tolerance: f64) {
-        self.tolerance = tolerance;
-        self.clear_cached_masks();
-    }
-
-    /// Drop any realized native mask images cached by the renderer state.
-    pub fn clear_cached_masks(&mut self) {
-        self.mask_cache.borrow_mut().clear();
-        self.retained_image_cache.borrow_mut().clear();
-    }
-
-    fn begin_frame(&mut self) {
-        if self.frame_active {
-            return;
-        }
-        self.retained_image_cache.borrow_mut().flip_mark();
-        self.frame_active = true;
-    }
-
-    fn finish_frame(&mut self) {
-        if !self.frame_active {
-            return;
-        }
-        self.retained_image_cache.borrow_mut().evict_unmarked();
-        self.frame_active = false;
-    }
-
+impl CommonRendererState {
     /// Create a short-lived renderer view bound to a caller-provided raster surface.
     pub fn bind<'a>(&'a mut self, surface: &'a mut sk::Surface) -> SkiaCpuRendererRef<'a> {
         SkiaCpuRendererRef {
             state: self,
-            surface,
+            mode: BoundCpuMode { surface },
         }
     }
 
-    /// Reset canvas state before starting a new frame on the provided raster surface.
+    /// Reset canvas state on the provided raster surface.
+    ///
+    /// This clears the surface to transparent, restores the canvas stack to its root save level,
+    /// and resets the current transform. It does not begin or finish a frame by itself.
+    ///
+    /// Call this before a top-level render pass when you want fresh contents. Do not call it
+    /// mid-frame unless you intentionally want to discard earlier drawing.
     pub fn reset(surface: &mut sk::Surface) {
         let canvas = surface.canvas();
         canvas.restore_to_count(1);
@@ -1040,12 +1350,15 @@ impl SkiaCpuRenderState {
     }
 
     /// Stream `imaging` commands directly into the provided raster surface.
+    ///
+    /// This is the reusable raster replay primitive. It records into the supplied surface and
+    /// finishes the sink, but it does not clear the surface first. Callers should pair it with an
+    /// explicit [`Self::reset`] when they need a clean destination.
     pub fn with_canvas_sink<R>(
         &mut self,
         surface: &mut sk::Surface,
         f: impl FnOnce(&mut SkCanvasSink<'_>) -> R,
     ) -> Result<R, Error> {
-        self.begin_frame();
         let mut sink = self.canvas_sink(surface);
         let out = f(&mut sink);
         let finish_result = sink.finish();
@@ -1054,6 +1367,10 @@ impl SkiaCpuRenderState {
     }
 
     /// Replay an `imaging` scene through the raster backend into the provided surface.
+    ///
+    /// This is a low-level draw helper. It validates and replays the scene, but it does not reset
+    /// the surface first. Top-level render entry points should do that explicitly when they want a
+    /// fresh frame.
     pub fn render_scene(&mut self, surface: &mut sk::Surface, scene: &Scene) -> Result<(), Error> {
         scene.validate().map_err(Error::InvalidScene)?;
         self.with_canvas_sink(surface, |sink| replay(scene, sink))
@@ -1061,17 +1378,18 @@ impl SkiaCpuRenderState {
     }
 
     /// Draw a native Skia picture through the raster backend into the provided surface.
+    ///
+    /// This draws into the current surface contents without resetting them first.
     pub fn render_picture(
         &mut self,
         surface: &mut sk::Surface,
         picture: &sk::Picture,
     ) -> Result<(), Error> {
-        self.begin_frame();
         surface.canvas().draw_picture(picture, None, None);
         Ok(())
     }
 
-    /// Read back the current raster surface into an unpremultiplied RGBA8 image.
+    /// Read back the current raster surface into an unpremultiplied sRGB RGBA8 image.
     ///
     /// This is the raster counterpart to the GPU renderer's readback helper.
     pub fn read_image(surface: &mut sk::Surface) -> Result<peniko::ImageData, Error> {
@@ -1104,11 +1422,295 @@ impl SkiaCpuRenderState {
     }
 }
 
-/// Owned CPU raster renderer that allocates and retains its own raster surface.
+/// Generic Skia CPU renderer implementation parameterized by mode-specific storage.
 #[derive(Debug)]
-pub struct SkiaCpuRenderer {
-    state: SkiaCpuRenderState,
+pub struct SkiaCpuRendererImpl<S, M> {
+    state: S,
+    mode: M,
+}
+
+/// Marker for the CPU renderer variant that owns an internal raster surface.
+#[derive(Debug)]
+pub struct OwnedCpuMode {
     surface: sk::Surface,
+}
+
+/// Marker for the CPU renderer variant that binds a caller-provided raster surface.
+#[derive(Debug)]
+pub struct BoundCpuMode<'a> {
+    surface: &'a mut sk::Surface,
+}
+
+/// Owned CPU raster renderer that allocates and retains its own raster surface.
+pub type SkiaCpuRenderer = SkiaCpuRendererImpl<CommonRendererState, OwnedCpuMode>;
+/// Borrowed CPU raster renderer view that binds reusable CPU state to a caller-owned surface.
+pub type SkiaCpuRendererRef<'a> =
+    SkiaCpuRendererImpl<&'a mut CommonRendererState, BoundCpuMode<'a>>;
+
+/// CPU target renderer that implements `imaging_backend::Backend` over caller-provided CPU
+/// targets.
+#[derive(Debug, Default)]
+pub struct SkiaCpuTargetRenderer {
+    state: CommonRendererState,
+}
+
+impl SkiaCpuTargetRenderer {
+    /// Create a CPU target renderer backed by reusable raster replay state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Borrow the reusable raster replay state.
+    pub fn state(&self) -> &CommonRendererState {
+        &self.state
+    }
+
+    /// Borrow the reusable raster replay state mutably.
+    pub fn state_mut(&mut self) -> &mut CommonRendererState {
+        &mut self.state
+    }
+
+    /// Consume the wrapper and return the underlying reusable raster replay state.
+    pub fn into_state(self) -> CommonRendererState {
+        self.state
+    }
+}
+
+impl SkiaCpuRendererImpl<CommonRendererState, OwnedCpuMode> {
+    /// Borrow the live raster `skia_safe::Surface`.
+    pub fn surface(&mut self) -> &mut sk::Surface {
+        &mut self.mode.surface
+    }
+
+    /// Set the geometric flattening tolerance used for path conversion.
+    pub fn set_tolerance(&mut self, tolerance: f64) {
+        self.state.tolerance = tolerance;
+        self.state.mask_cache.borrow_mut().clear();
+        self.state.retained_image_cache.borrow_mut().clear();
+    }
+
+    /// Drop any realized mask artifacts cached by the renderer.
+    pub fn clear_cached_masks(&mut self) {
+        self.state.mask_cache.borrow_mut().clear();
+        self.state.retained_image_cache.borrow_mut().clear();
+    }
+
+    /// Reset canvas state on the current raster surface.
+    ///
+    /// This is a surface-preparation helper only. It does not read back results or otherwise
+    /// finalize the frame.
+    pub fn reset(&mut self) {
+        CommonRendererState::reset(&mut self.mode.surface);
+    }
+
+    /// Stream `imaging` commands directly into the current raster surface.
+    ///
+    /// This forwards to the reusable CPU replay path and does not clear the surface first.
+    pub fn with_canvas_sink<R>(
+        &mut self,
+        f: impl FnOnce(&mut SkCanvasSink<'_>) -> R,
+    ) -> Result<R, Error> {
+        self.state.with_canvas_sink(&mut self.mode.surface, f)
+    }
+
+    /// Replay an `imaging` scene through the current raster backend.
+    ///
+    /// This does not call [`Self::reset`]. Use the `*_rgba8` convenience methods when you want a
+    /// fresh frame plus readback in one call.
+    pub fn render_scene(&mut self, scene: &Scene) -> Result<(), Error> {
+        self.state.render_scene(&mut self.mode.surface, scene)
+    }
+
+    /// Reset, render a recorded scene, and return RGBA8 bytes.
+    pub fn render_scene_rgba8(&mut self, scene: &Scene) -> Result<Vec<u8>, Error> {
+        self.state.retained_image_cache.borrow_mut().flip_mark();
+        self.reset();
+        self.render_scene(scene)?;
+        self.state
+            .retained_image_cache
+            .borrow_mut()
+            .evict_unmarked();
+        Ok(self.read_image()?.data.as_ref().to_vec())
+    }
+
+    /// Draw a native Skia picture through the current raster backend.
+    ///
+    /// This preserves existing contents unless the caller reset the surface earlier in the frame.
+    pub fn render_picture(&mut self, picture: &sk::Picture) -> Result<(), Error> {
+        self.state.render_picture(&mut self.mode.surface, picture)
+    }
+
+    /// Reset, draw a native Skia picture, and return RGBA8 bytes.
+    pub fn render_picture_rgba8(&mut self, picture: &sk::Picture) -> Result<Vec<u8>, Error> {
+        self.state.retained_image_cache.borrow_mut().flip_mark();
+        self.reset();
+        self.render_picture(picture)?;
+        self.state
+            .retained_image_cache
+            .borrow_mut()
+            .evict_unmarked();
+        Ok(self.read_image()?.data.as_ref().to_vec())
+    }
+
+    /// Read back the current raster surface into an unpremultiplied RGBA8 image.
+    pub fn read_image(&mut self) -> Result<peniko::ImageData, Error> {
+        CommonRendererState::read_image(&mut self.mode.surface)
+    }
+}
+
+impl SkiaCpuRendererImpl<&mut CommonRendererState, BoundCpuMode<'_>> {
+    /// Set the geometric flattening tolerance used for path conversion.
+    pub fn set_tolerance(&mut self, tolerance: f64) {
+        self.state.tolerance = tolerance;
+        self.state.mask_cache.borrow_mut().clear();
+        self.state.retained_image_cache.borrow_mut().clear();
+    }
+
+    /// Drop any realized mask artifacts cached by the renderer.
+    pub fn clear_cached_masks(&mut self) {
+        self.state.mask_cache.borrow_mut().clear();
+        self.state.retained_image_cache.borrow_mut().clear();
+    }
+
+    /// Borrow the live raster `skia_safe::Surface`.
+    pub fn surface(&mut self) -> &mut sk::Surface {
+        self.mode.surface
+    }
+
+    /// Reset canvas state on the current raster surface.
+    ///
+    /// This is a surface-preparation helper only. It does not read back results or otherwise
+    /// finalize the frame.
+    pub fn reset(&mut self) {
+        CommonRendererState::reset(self.mode.surface);
+    }
+
+    /// Stream `imaging` commands directly into the current raster surface.
+    ///
+    /// This forwards to the reusable CPU replay path and does not clear the surface first.
+    pub fn with_canvas_sink<R>(
+        &mut self,
+        f: impl FnOnce(&mut SkCanvasSink<'_>) -> R,
+    ) -> Result<R, Error> {
+        self.state.with_canvas_sink(self.mode.surface, f)
+    }
+
+    /// Replay an `imaging` scene through the current raster backend.
+    ///
+    /// This does not call [`Self::reset`]. Use the `*_rgba8` convenience methods when you want a
+    /// fresh frame plus readback in one call.
+    pub fn render_scene(&mut self, scene: &Scene) -> Result<(), Error> {
+        self.state.render_scene(self.mode.surface, scene)
+    }
+
+    /// Reset, render a recorded scene, and return RGBA8 bytes.
+    pub fn render_scene_rgba8(&mut self, scene: &Scene) -> Result<Vec<u8>, Error> {
+        self.state.retained_image_cache.borrow_mut().flip_mark();
+        self.reset();
+        self.render_scene(scene)?;
+        self.state
+            .retained_image_cache
+            .borrow_mut()
+            .evict_unmarked();
+        Ok(self.read_image()?.data.as_ref().to_vec())
+    }
+
+    /// Draw a native Skia picture through the current raster backend.
+    ///
+    /// This preserves existing contents unless the caller reset the surface earlier in the frame.
+    pub fn render_picture(&mut self, picture: &sk::Picture) -> Result<(), Error> {
+        self.state.render_picture(self.mode.surface, picture)
+    }
+
+    /// Reset, draw a native Skia picture, and return RGBA8 bytes.
+    pub fn render_picture_rgba8(&mut self, picture: &sk::Picture) -> Result<Vec<u8>, Error> {
+        self.state.retained_image_cache.borrow_mut().flip_mark();
+        self.reset();
+        self.render_picture(picture)?;
+        self.state
+            .retained_image_cache
+            .borrow_mut()
+            .evict_unmarked();
+        Ok(self.read_image()?.data.as_ref().to_vec())
+    }
+
+    /// Read back the current raster surface into an unpremultiplied RGBA8 image.
+    pub fn read_image(&mut self) -> Result<peniko::ImageData, Error> {
+        CommonRendererState::read_image(self.mode.surface)
+    }
+}
+
+impl ImagingBackend for SkiaCpuTargetRenderer {
+    type Error = String;
+    type Image = peniko::ImageData;
+    type BufferTarget<'a> = CpuBufferTarget<'a>;
+    type TextureTarget<'a> = Infallible;
+
+    fn render_to_buffer<'a>(
+        &mut self,
+        _size: Size,
+        source: &mut dyn RenderSource,
+        target: Self::BufferTarget<'a>,
+    ) -> Result<(), Self::Error> {
+        let color_type = match target.format.channel_order {
+            CpuBufferChannelOrder::Rgba8 => sk::ColorType::RGBA8888,
+            CpuBufferChannelOrder::Bgra8 => sk::ColorType::BGRA8888,
+        };
+        let alpha_type = match target.format.alpha_mode {
+            CpuBufferAlphaMode::Opaque => sk::AlphaType::Opaque,
+            CpuBufferAlphaMode::Premultiplied => sk::AlphaType::Premul,
+        };
+        let info = sk::ImageInfo::new(
+            (target.width as i32, target.height as i32),
+            color_type,
+            alpha_type,
+            None,
+        );
+        let mut surface =
+            sk::surfaces::wrap_pixels(&info, target.buffer, Some(target.bytes_per_row), None)
+                .ok_or_else(|| "wrap skia cpu target pixels".to_string())?;
+        self.state.retained_image_cache.borrow_mut().flip_mark();
+        CommonRendererState::reset(&mut surface);
+        self.state.with_canvas_sink(&mut surface, |sink| source.paint_into(sink))
+            .map_err(|err| format!("{err:?}"))?;
+        self.state.retained_image_cache.borrow_mut().evict_unmarked();
+        Ok(())
+    }
+
+    fn render_to_texture<'a>(
+        &mut self,
+        _size: Size,
+        _source: &mut dyn RenderSource,
+        target: Self::TextureTarget<'a>,
+    ) -> Result<(), Self::Error> {
+        match target {}
+    }
+
+    fn render_to_image(
+        &mut self,
+        size: Size,
+        source: &mut dyn RenderSource,
+        width: u32,
+        height: u32,
+    ) -> Result<Self::Image, Self::Error> {
+        let info = sk::ImageInfo::new(
+            (width as i32, height as i32),
+            sk::ColorType::RGBA8888,
+            sk::AlphaType::Premul,
+            None,
+        );
+        let mut surface = sk::surfaces::raster(&info, None, None)
+            .ok_or_else(|| "create skia raster RGBA8888/premul surface".to_string())?;
+        self.state.retained_image_cache.borrow_mut().flip_mark();
+        CommonRendererState::reset(&mut surface);
+        self.state.with_canvas_sink(&mut surface, |sink| {
+            let _ = size;
+            source.paint_into(sink);
+        })
+        .map_err(|err| format!("{err:?}"))?;
+        self.state.retained_image_cache.borrow_mut().evict_unmarked();
+        CommonRendererState::read_image(&mut surface).map_err(|err| format!("{err:?}"))
+    }
 }
 
 impl SkiaCpuRenderer {
@@ -1128,184 +1730,9 @@ impl SkiaCpuRenderer {
         let surface = sk::surfaces::raster(&info, None, None)
             .expect("create skia raster RGBA8888/premul surface");
         Self {
-            state: SkiaCpuRenderState::new(),
-            surface,
+            state: CommonRendererState::new(),
+            mode: OwnedCpuMode { surface },
         }
-    }
-
-    /// Set the geometric flattening tolerance used for path conversion.
-    pub fn set_tolerance(&mut self, tolerance: f64) {
-        self.state.set_tolerance(tolerance);
-    }
-
-    /// Drop any realized mask artifacts cached by the renderer.
-    pub fn clear_cached_masks(&mut self) {
-        self.state.clear_cached_masks();
-    }
-
-    /// Borrow the live raster `skia_safe::Surface`.
-    pub fn surface(&mut self) -> &mut sk::Surface {
-        &mut self.surface
-    }
-
-    /// Reset canvas state before starting a new frame on the owned surface.
-    pub fn reset(&mut self) {
-        self.state.finish_frame();
-        SkiaCpuRenderState::reset(&mut self.surface);
-    }
-
-    /// Stream `imaging` commands directly into the owned raster surface.
-    pub fn with_canvas_sink<R>(
-        &mut self,
-        f: impl FnOnce(&mut SkCanvasSink<'_>) -> R,
-    ) -> Result<R, Error> {
-        self.state.with_canvas_sink(&mut self.surface, f)
-    }
-
-    /// Replay an `imaging` scene through the owned raster backend.
-    pub fn render_scene(&mut self, scene: &Scene) -> Result<(), Error> {
-        self.state.render_scene(&mut self.surface, scene)
-    }
-
-    /// Reset, render a recorded scene, and return RGBA8 bytes.
-    pub fn render_scene_rgba8(&mut self, scene: &Scene) -> Result<Vec<u8>, Error> {
-        self.reset();
-        self.render_scene(scene)?;
-        Ok(self.read_image()?.data.as_ref().to_vec())
-    }
-
-    /// Draw a native Skia picture through the owned raster backend.
-    pub fn render_picture(&mut self, picture: &sk::Picture) -> Result<(), Error> {
-        self.state.render_picture(&mut self.surface, picture)
-    }
-
-    /// Reset, draw a native Skia picture, and return RGBA8 bytes.
-    pub fn render_picture_rgba8(&mut self, picture: &sk::Picture) -> Result<Vec<u8>, Error> {
-        self.reset();
-        self.render_picture(picture)?;
-        Ok(self.read_image()?.data.as_ref().to_vec())
-    }
-
-    /// Read back the current owned raster surface into an unpremultiplied RGBA8 image.
-    pub fn read_image(&mut self) -> Result<peniko::ImageData, Error> {
-        SkiaCpuRenderState::read_image(&mut self.surface)
-    }
-}
-
-/// CPU target renderer that binds reusable Skia CPU state to a caller-provided pixel buffer.
-pub struct SkiaCpuTargetRenderer<'a> {
-    state: SkiaCpuRenderState,
-    surface: sk::Borrows<'a, sk::Surface>,
-}
-
-impl<'a> core::fmt::Debug for SkiaCpuTargetRenderer<'a> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("SkiaCpuTargetRenderer")
-            .field("state", &self.state)
-            .finish_non_exhaustive()
-    }
-}
-
-impl SkiaCpuTargetRenderer<'_> {
-    fn with_renderer<R>(&mut self, f: impl FnOnce(&mut SkiaCpuRendererRef<'_>) -> R) -> R {
-        let mut renderer = self.state.bind(&mut self.surface);
-        f(&mut renderer)
-    }
-
-    fn readback_image(&mut self) -> Result<peniko::ImageData, Error> {
-        self.with_renderer(|renderer| renderer.read_image())
-    }
-
-    fn with_canvas<R>(&mut self, f: &mut dyn FnMut(&mut dyn PaintSink) -> R) -> R {
-        let mut renderer = self.state.bind(&mut self.surface);
-        renderer
-            .with_canvas_sink(|sink| f(sink))
-            .expect("render into imaging_skia cpu target sink")
-    }
-}
-
-impl RenderCore for SkiaCpuTargetRenderer<'_> {
-    fn render(&mut self, f: &mut dyn FnMut(&mut dyn PaintSink)) {
-        self.with_canvas(&mut |canvas| f(canvas));
-    }
-
-    fn finish(&mut self) {
-        self.state.finish_frame();
-    }
-
-    fn readback(&mut self) -> Option<RenderOutput> {
-        self.readback_image().ok().map(RenderOutput::Image)
-    }
-
-    fn debug_info(&self) -> String {
-        "name: Skia CPU\ninfo: imaging_skia::SkiaCpuTargetRenderer".to_string()
-    }
-}
-
-impl<'a> TargetRenderer for SkiaCpuTargetRenderer<'a> {
-    type Target = CpuBufferTarget<'a>;
-
-    fn create(_frame: BeginFrame, target: Self::Target) -> Result<Self, String> {
-        let color_type = match target.format {
-            CpuBufferFormat::Rgba8Opaque => sk::ColorType::RGBA8888,
-            CpuBufferFormat::Bgra8Opaque => sk::ColorType::BGRA8888,
-        };
-        let info = sk::ImageInfo::new(
-            (target.width as i32, target.height as i32),
-            color_type,
-            sk::AlphaType::Opaque,
-            None,
-        );
-        let surface =
-            sk::surfaces::wrap_pixels(&info, target.buffer, Some(target.bytes_per_row), None)
-                .ok_or_else(|| "wrap skia cpu target pixels".to_string())?;
-        Ok(Self {
-            state: SkiaCpuRenderState::new(),
-            surface,
-        })
-    }
-}
-
-/// Borrowed CPU raster renderer view that binds reusable CPU state to a caller-owned surface.
-#[derive(Debug)]
-pub struct SkiaCpuRendererRef<'a> {
-    state: &'a mut SkiaCpuRenderState,
-    surface: &'a mut sk::Surface,
-}
-
-impl SkiaCpuRendererRef<'_> {
-    /// Reset canvas state before starting a new frame on the bound raster surface.
-    pub fn reset(&mut self) {
-        self.state.finish_frame();
-        SkiaCpuRenderState::reset(self.surface);
-    }
-
-    /// Stream `imaging` commands directly into the bound raster surface.
-    pub fn with_canvas_sink<R>(
-        &mut self,
-        f: impl FnOnce(&mut SkCanvasSink<'_>) -> R,
-    ) -> Result<R, Error> {
-        self.state.with_canvas_sink(self.surface, f)
-    }
-
-    /// Replay an `imaging` scene through the bound raster surface.
-    pub fn render_scene(&mut self, scene: &Scene) -> Result<(), Error> {
-        self.state.render_scene(self.surface, scene)
-    }
-
-    /// Draw a native Skia picture through the bound raster surface.
-    pub fn render_picture(&mut self, picture: &sk::Picture) -> Result<(), Error> {
-        self.state.render_picture(self.surface, picture)
-    }
-
-    /// Read back the current bound raster surface into an unpremultiplied RGBA8 image.
-    pub fn read_image(&mut self) -> Result<peniko::ImageData, Error> {
-        SkiaCpuRenderState::read_image(self.surface)
-    }
-
-    /// Borrow the currently bound raster `skia_safe::Surface`.
-    pub fn surface(&mut self) -> &mut sk::Surface {
-        self.surface
     }
 }
 
@@ -1316,7 +1743,7 @@ pub(crate) fn color_type_for_wgpu_texture_format(
 ) -> Result<sk::ColorType, Error> {
     match texture_format {
         wgpu::TextureFormat::Rgba8Unorm => Ok(sk::ColorType::RGBA8888),
-        wgpu::TextureFormat::Rgba8UnormSrgb => Ok(sk::ColorType::SRGBA8888),
+        wgpu::TextureFormat::Rgba8UnormSrgb => Ok(sk::ColorType::RGBA8888),
         wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
             Ok(sk::ColorType::BGRA8888)
         }
@@ -1324,19 +1751,6 @@ pub(crate) fn color_type_for_wgpu_texture_format(
         wgpu::TextureFormat::Rgba16Unorm => Ok(sk::ColorType::R16G16B16A16UNorm),
         wgpu::TextureFormat::Rgba16Float => Ok(sk::ColorType::RGBAF16),
         _ => Err(Error::Internal("unsupported wgpu texture format")),
-    }
-}
-
-#[cfg(feature = "wgpu")]
-/// Attach an explicit Skia color space when the wrapped `wgpu` texture is sRGB encoded.
-pub(crate) fn color_space_for_wgpu_texture_format(
-    texture_format: wgpu::TextureFormat,
-) -> Option<sk::ColorSpace> {
-    match texture_format {
-        wgpu::TextureFormat::Rgba8UnormSrgb | wgpu::TextureFormat::Bgra8UnormSrgb => {
-            Some(sk::ColorSpace::new_srgb())
-        }
-        _ => None,
     }
 }
 
@@ -1353,6 +1767,45 @@ pub(crate) fn color_space_for_wgpu_texture_format(
 /// wgpu's deferred clear never fires. The clear value doesn't matter since
 /// Skia will overwrite the entire texture, but transparent is the least
 /// surprising default if anything goes wrong.
+#[cfg(feature = "wgpu")]
+fn wgpu_texture_init_key(texture: &wgpu::Texture) -> Option<u64> {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let texture = unsafe { texture.as_hal::<wgpu::hal::api::Metal>()? };
+        return Some(unsafe { texture.raw_handle() }.as_ptr() as usize as u64);
+    }
+
+    #[cfg(all(feature = "vulkan", not(any(target_os = "macos", target_os = "ios"))))]
+    {
+        use ash::vk::Handle as _;
+
+        let texture = unsafe { texture.as_hal::<wgpu::hal::api::Vulkan>()? };
+        return Some(texture.raw_handle().as_raw());
+    }
+
+    #[allow(
+        unreachable_code,
+        reason = "Feature-gated backend probes return early on supported platforms and fall through otherwise."
+    )]
+    None
+}
+
+#[cfg(feature = "wgpu")]
+fn initialize_texture_for_wgpu_if_needed(
+    initialized_targets: &mut HashSet<u64>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+) {
+    if let Some(key) = wgpu_texture_init_key(texture) {
+        if initialized_targets.insert(key) {
+            initialize_texture_for_wgpu(device, queue, texture);
+        }
+    } else {
+        initialize_texture_for_wgpu(device, queue, texture);
+    }
+}
+
 #[cfg(feature = "wgpu")]
 fn initialize_texture_for_wgpu(
     device: &wgpu::Device,
@@ -1931,7 +2384,7 @@ mod tests {
         );
         assert_eq!(
             color_type_for_wgpu_texture_format(wgpu::TextureFormat::Rgba8UnormSrgb).unwrap(),
-            sk::ColorType::SRGBA8888
+            sk::ColorType::RGBA8888
         );
         assert_eq!(
             color_type_for_wgpu_texture_format(wgpu::TextureFormat::Bgra8Unorm).unwrap(),

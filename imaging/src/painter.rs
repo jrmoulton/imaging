@@ -220,6 +220,7 @@ where
             transform: Affine::IDENTITY,
             glyph_transform: None,
             font_size: 16.0,
+            font_embolden: kurbo::Vec2::ZERO,
             hint: false,
             normalized_coords: &[],
             brush: brush.into(),
@@ -853,6 +854,7 @@ pub struct GlyphRunBuilder<'a, S: ?Sized> {
     transform: Affine,
     glyph_transform: Option<Affine>,
     font_size: f32,
+    font_embolden: kurbo::Vec2,
     hint: bool,
     normalized_coords: &'a [NormalizedCoord],
     brush: BrushRef<'a>,
@@ -881,6 +883,13 @@ where
     #[must_use]
     pub fn font_size(mut self, font_size: f32) -> Self {
         self.font_size = font_size;
+        self
+    }
+
+    /// Set the faux-bold strength applied during glyph rasterization.
+    #[must_use]
+    pub fn font_embolden(mut self, font_embolden: kurbo::Vec2) -> Self {
+        self.font_embolden = font_embolden;
         self
     }
 
@@ -918,6 +927,7 @@ where
                 transform: self.transform,
                 glyph_transform: self.glyph_transform,
                 font_size: self.font_size,
+                font_embolden: self.font_embolden,
                 hint: self.hint,
                 normalized_coords: self.normalized_coords,
                 style,

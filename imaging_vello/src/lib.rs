@@ -118,6 +118,12 @@ pub use vello_08 as vello;
 
 use crate::vello::wgpu;
 use crate::vello::{AaConfig, RenderParams};
+use imaging::PaintSink;
+use core::convert::Infallible;
+use imaging_backend::{
+    Backend as ImagingBackend, GpuTextureTarget, GpuTextureTargetInfo, RenderOutput, RenderSource,
+};
+use kurbo::Size;
 
 pub use scene_sink::VelloSceneSink;
 
@@ -170,6 +176,26 @@ impl core::fmt::Debug for VelloRenderer {
         f.debug_struct("VelloRenderer")
             .field("width", &self.width)
             .field("height", &self.height)
+            .finish_non_exhaustive()
+    }
+}
+
+/// GPU copy renderer that records into a native Vello scene and renders into an owned texture.
+pub struct VelloGpuCopyRenderer {
+    renderer: vello::Renderer,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    texture_view: wgpu::TextureView,
+    texture_format: wgpu::TextureFormat,
+    size: (u32, u32),
+    scene: vello::Scene,
+}
+
+impl core::fmt::Debug for VelloGpuCopyRenderer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("VelloGpuCopyRenderer")
+            .field("width", &self.size.0)
+            .field("height", &self.size.1)
             .finish_non_exhaustive()
     }
 }
@@ -244,6 +270,177 @@ impl VelloRenderer {
             self.width,
             self.height,
         )
+    }
+}
+
+impl VelloGpuCopyRenderer {
+    /// Create a GPU-copy renderer for a fixed-size target using caller-provided `wgpu` state.
+    pub fn try_new_with_device_queue(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        width: u16,
+        height: u16,
+        format: wgpu::TextureFormat,
+    ) -> Result<Self, Error> {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imaging_vello gpu copy render target"),
+            size: wgpu::Extent3d {
+                width: u32::from(width),
+                height: u32::from(height),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::STORAGE_BINDING,
+            format,
+            view_formats: &[format],
+        });
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let renderer = vello::Renderer::new(&device, vello::RendererOptions::default())
+            .map_err(Error::Render)?;
+        Ok(Self {
+            renderer,
+            device,
+            queue,
+            texture_view,
+            texture_format: format,
+            size: (u32::from(width), u32::from(height)),
+            scene: vello::Scene::new(),
+        })
+    }
+
+    fn with_scene_sink<R>(&mut self, f: &mut dyn FnMut(&mut dyn PaintSink) -> R) -> R {
+        let bounds = Rect::new(0.0, 0.0, f64::from(self.size.0), f64::from(self.size.1));
+        let mut sink = VelloSceneSink::new(&mut self.scene, bounds);
+        let out = f(&mut sink);
+        let _ = sink.finish();
+        out
+    }
+}
+
+impl VelloGpuCopyRenderer {
+    fn with_paint_sink(&mut self, f: &mut dyn FnMut(&mut dyn PaintSink)) {
+        self.with_scene_sink(&mut |canvas| f(canvas));
+    }
+
+    fn finish(&mut self) {
+        let params = RenderParams {
+            base_color: peniko::Color::from_rgba8(0, 0, 0, 0),
+            width: self.size.0,
+            height: self.size.1,
+            antialiasing_method: AaConfig::Area,
+        };
+
+        self.renderer
+            .render_to_texture(
+                &self.device,
+                &self.queue,
+                &self.scene,
+                &self.texture_view,
+                &params,
+            )
+            .expect("render into imaging_vello gpu copy target");
+    }
+
+    #[cfg(test)]
+    fn readback(&mut self) -> Option<RenderOutput> {
+        Some(RenderOutput::GpuTexture(self.texture_view.clone()))
+    }
+
+    fn set_target(&mut self, _size: Size, target: GpuTextureTarget) -> Result<(), String> {
+        let texture = target.texture_view.texture();
+        let size = texture.size();
+        let format = texture.format();
+        if self.texture_format != format {
+            self.renderer = vello::Renderer::new(&target.device, vello::RendererOptions::default())
+                .map_err(|err| format!("{err:?}"))?;
+            self.texture_format = format;
+        }
+        self.device = target.device;
+        self.queue = target.queue;
+        self.texture_view = target.texture_view;
+        self.size = (size.width, size.height);
+        self.scene.reset();
+        Ok(())
+    }
+}
+
+impl ImagingBackend for VelloGpuCopyRenderer {
+    type Error = String;
+    type Image = peniko::ImageData;
+    type BufferTarget<'a> = Infallible;
+    type TextureTarget<'a> = GpuTextureTarget;
+
+    fn supports_texture_target(target: &GpuTextureTargetInfo) -> Result<(), Self::Error> {
+        match target.format {
+            wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => Ok(()),
+            _ => Err("vello gpu backend only supports rgba8 texture targets directly".to_string()),
+        }
+    }
+
+    fn render_to_buffer<'a>(
+        &mut self,
+        _size: Size,
+        _source: &mut dyn RenderSource,
+        target: Self::BufferTarget<'a>,
+    ) -> Result<(), Self::Error> {
+        match target {}
+    }
+
+    fn render_to_texture<'a>(
+        &mut self,
+        size: Size,
+        source: &mut dyn RenderSource,
+        target: Self::TextureTarget<'a>,
+    ) -> Result<(), Self::Error> {
+        self.set_target(size, target)?;
+        self.with_paint_sink(&mut |sink| source.paint_into(sink));
+        self.finish();
+        Ok(())
+    }
+
+    fn render_to_image(
+        &mut self,
+        size: Size,
+        source: &mut dyn RenderSource,
+        width: u32,
+        height: u32,
+    ) -> Result<Self::Image, Self::Error> {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imaging_vello gpu image target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+        });
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.set_target(
+            size,
+            GpuTextureTarget {
+                device: self.device.clone(),
+                queue: self.queue.clone(),
+                texture_view,
+            },
+        )?;
+        self.with_paint_sink(&mut |sink| source.paint_into(sink));
+        self.finish();
+        RenderOutput::GpuTexture(self.texture_view.clone())
+            .into_image_with(&self.device, &self.queue)
+            .ok_or_else(|| "vello gpu backend failed to read rendered image".to_string())
     }
 }
 
@@ -359,4 +556,81 @@ fn readback_rgba8(
     drop(mapped);
     readback.unmap();
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use imaging::Painter;
+    use kurbo::Size;
+    use peniko::Color;
+
+    fn try_init_device_and_queue() -> Result<(wgpu::Device, wgpu::Queue), ()> {
+        pollster::block_on(async {
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::default(),
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                })
+                .await
+                .map_err(|_| ())?;
+            adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("imaging_vello test device"),
+                    required_features: wgpu::Features::empty(),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|_| ())
+        })
+    }
+
+    #[test]
+    fn gpu_copy_renderer_renders_into_owned_texture() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imaging_vello gpu copy test texture"),
+            size: wgpu::Extent3d {
+                width: 32,
+                height: 32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let readback_device = device.clone();
+        let readback_queue = queue.clone();
+        let mut renderer = VelloGpuCopyRenderer::try_new_with_device_queue(
+            device,
+            queue,
+            32,
+            32,
+            wgpu::TextureFormat::Rgba8Unorm,
+        )
+        .expect("create gpu copy renderer");
+
+        renderer.with_paint_sink(&mut |canvas| {
+            let mut painter = Painter::new(canvas);
+            painter.fill_rect(
+                Rect::new(0.0, 0.0, 32.0, 32.0),
+                Color::from_rgb8(0x2a, 0x6f, 0xdb),
+            );
+        });
+        renderer.finish();
+
+        let image = renderer
+            .readback()
+            .and_then(|output| output.into_image_with(&readback_device, &readback_queue))
+            .expect("read back gpu copy renderer image");
+        assert_eq!(image.width, 32);
+        assert_eq!(image.height, 32);
+    }
 }

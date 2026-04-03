@@ -18,7 +18,7 @@ use skia_safe as sk;
 use crate::Error;
 #[cfg(feature = "wgpu")]
 use crate::{
-    SkiaRenderer, color_space_for_wgpu_texture_format, color_type_for_wgpu_texture_format,
+    SkiaGpuRenderer, SkiaGpuTargetRenderer, SkiaRendererImpl, color_type_for_wgpu_texture_format,
     ganesh::GaneshBackend,
 };
 
@@ -76,7 +76,7 @@ impl MetalBackend {
 }
 
 #[cfg(feature = "wgpu")]
-impl SkiaRenderer {
+impl SkiaGpuRenderer {
     /// Create an offscreen renderer backed by a caller-owned Metal device and command queue.
     ///
     /// This is the bridge used when the application already chose Metal through `wgpu` and wants
@@ -139,6 +139,65 @@ impl SkiaRenderer {
             )
         }
     }
+}
+
+#[cfg(feature = "wgpu")]
+impl<M> SkiaRendererImpl<M> {
+    pub(crate) unsafe fn create_metal_surface(
+        &mut self,
+        width: u16,
+        height: u16,
+        texture_format: wgpu::TextureFormat,
+        texture: sk::gpu::mtl::Handle,
+    ) -> Result<sk::Surface, Error> {
+        let width = i32::from(width);
+        let height = i32::from(height);
+        self.state.backend.ensure_current()?;
+        create_wrapped_metal_surface(
+            self.state.backend.direct_context(),
+            width,
+            height,
+            texture_format,
+            texture,
+        )
+    }
+
+    pub(crate) unsafe fn create_metal_surface_raw(
+        &mut self,
+        width: u16,
+        height: u16,
+        texture_format: wgpu::TextureFormat,
+        texture: *mut c_void,
+    ) -> Result<sk::Surface, Error> {
+        unsafe {
+            self.create_metal_surface(width, height, texture_format, texture.cast_const().cast())
+        }
+    }
+}
+
+#[cfg(feature = "wgpu")]
+impl SkiaGpuTargetRenderer {
+    /// Create a renderer that shares caller-owned Metal backend objects for later target binding.
+    pub unsafe fn try_new_metal_from_handles(
+        device: sk::gpu::mtl::Handle,
+        command_queue: sk::gpu::mtl::Handle,
+    ) -> Result<Self, Error> {
+        let backend = unsafe { GaneshBackend::from_metal_handles(device, command_queue)? };
+        Ok(Self::from_backend(backend))
+    }
+
+    /// Create a renderer from raw Objective-C pointers to a Metal device and queue.
+    pub unsafe fn try_new_metal_from_raw_pointers_without_texture(
+        device: *mut c_void,
+        command_queue: *mut c_void,
+    ) -> Result<Self, Error> {
+        unsafe {
+            Self::try_new_metal_from_handles(
+                device.cast_const().cast(),
+                command_queue.cast_const().cast(),
+            )
+        }
+    }
 
     /// Create a renderer that draws directly into a caller-owned Metal texture.
     ///
@@ -158,17 +217,8 @@ impl SkiaRenderer {
         command_queue: sk::gpu::mtl::Handle,
         texture: sk::gpu::mtl::Handle,
     ) -> Result<Self, Error> {
-        let width = i32::from(width);
-        let height = i32::from(height);
-        let mut backend = unsafe { GaneshBackend::from_metal_handles(device, command_queue)? };
-        let surface = create_wrapped_metal_surface(
-            backend.direct_context(),
-            width,
-            height,
-            texture_format,
-            texture,
-        )?;
-        Ok(Self::from_backend_surface(backend, surface))
+        let _ = (width, height, texture_format, texture);
+        unsafe { Self::try_new_metal_from_handles(device, command_queue) }
     }
 
     /// Create a renderer that draws into a caller-owned Metal texture via raw Objective-C pointers.
@@ -216,18 +266,7 @@ impl SkiaRenderer {
         texture_format: wgpu::TextureFormat,
         texture: sk::gpu::mtl::Handle,
     ) -> Result<(), Error> {
-        let width = i32::from(width);
-        let height = i32::from(height);
-        self.backend.ensure_current()?;
-        self.backend.flush_surface(&mut self.surface);
-        let surface = create_wrapped_metal_surface(
-            self.backend.direct_context(),
-            width,
-            height,
-            texture_format,
-            texture,
-        )?;
-        self.surface = surface;
+        let _ = unsafe { self.create_metal_surface(width, height, texture_format, texture) }?;
         Ok(())
     }
 
@@ -246,15 +285,14 @@ impl SkiaRenderer {
         texture_format: wgpu::TextureFormat,
         texture: *mut c_void,
     ) -> Result<(), Error> {
-        unsafe {
-            self.replace_metal_texture(width, height, texture_format, texture.cast_const().cast())
-        }
+        let _ = unsafe { self.create_metal_surface_raw(width, height, texture_format, texture) }?;
+        Ok(())
     }
 }
 
 #[cfg(feature = "wgpu")]
 /// Wrap a caller-owned Metal texture in a Skia surface for direct rendering.
-fn create_wrapped_metal_surface(
+pub(crate) fn create_wrapped_metal_surface(
     context: &mut sk::gpu::DirectContext,
     width: i32,
     height: i32,
@@ -262,21 +300,14 @@ fn create_wrapped_metal_surface(
     texture: sk::gpu::mtl::Handle,
 ) -> Result<sk::Surface, Error> {
     let texture_info = unsafe { sk::gpu::mtl::TextureInfo::new(texture) };
-    let backend_texture = unsafe {
-        sk::gpu::backend_textures::make_mtl(
-            (width, height),
-            sk::gpu::Mipmapped::No,
-            &texture_info,
-            "ImagingSkiaWgpuWrappedMetalTexture",
-        )
-    };
-    sk::gpu::surfaces::wrap_backend_texture(
+    let backend_render_target =
+        sk::gpu::backend_render_targets::make_mtl((width, height), &texture_info);
+    sk::gpu::surfaces::wrap_backend_render_target(
         context,
-        &backend_texture,
+        &backend_render_target,
         sk::gpu::SurfaceOrigin::TopLeft,
-        None,
         color_type_for_wgpu_texture_format(texture_format)?,
-        color_space_for_wgpu_texture_format(texture_format),
+        None,
         None,
     )
     .ok_or(Error::CreateGpuSurface)

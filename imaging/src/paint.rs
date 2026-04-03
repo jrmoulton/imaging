@@ -7,7 +7,7 @@
 //! first constructing owned recording payloads. [`crate::record::Scene`] remains the owned
 //! semantic recording format.
 
-use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke};
+use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke, Vec2};
 use peniko::{BrushRef, Fill, Style};
 
 use crate::{
@@ -685,6 +685,8 @@ pub struct GlyphRunRef<'a> {
     pub glyph_transform: Option<Affine>,
     /// Font size in pixels per em.
     pub font_size: f32,
+    /// Faux-bold strength applied during glyph rasterization.
+    pub font_embolden: Vec2,
     /// Whether glyph hinting is enabled.
     pub hint: bool,
     /// Normalized variation coordinates for a variable font instance.
@@ -718,6 +720,7 @@ impl<'a> GlyphRunRef<'a> {
             transform: Affine::IDENTITY,
             glyph_transform: None,
             font_size: 16.0,
+            font_embolden: Vec2::ZERO,
             hint: false,
             normalized_coords: &[],
             style,
@@ -734,6 +737,7 @@ impl<'a> GlyphRunRef<'a> {
             transform: self.transform,
             glyph_transform: self.glyph_transform,
             font_size: self.font_size,
+            font_embolden: self.font_embolden,
             hint: self.hint,
             normalized_coords: self.normalized_coords.to_vec(),
             style: self.style.clone(),
@@ -925,6 +929,7 @@ impl GlyphRun {
             transform: self.transform,
             glyph_transform: self.glyph_transform,
             font_size: self.font_size,
+            font_embolden: self.font_embolden,
             hint: self.hint,
             normalized_coords: &self.normalized_coords,
             style: &self.style,
@@ -1185,20 +1190,15 @@ mod tests {
         });
         let font = FontData::new(peniko::Blob::new(Arc::new([0_u8, 1_u8, 2_u8, 3_u8])), 0);
         let glyph_id = source.draw(Draw::GlyphRun(GlyphRun {
-            font,
             transform: Affine::translate((19.0, 20.0)),
             glyph_transform: Some(Affine::translate((21.0, 22.0))),
             font_size: 12.0,
-            hint: false,
-            normalized_coords: vec![],
-            style: Style::Fill(Fill::NonZero),
             glyphs: vec![Glyph {
                 id: 7,
                 x: 0.0,
                 y: 0.0,
             }],
-            brush: Brush::Solid(peniko::Color::BLACK),
-            composite: Composite::default(),
+            ..GlyphRun::new(font)
         }));
         let blur_id = source.draw(Draw::BlurredRoundedRect(BlurredRoundedRect {
             transform: Affine::translate((23.0, 24.0)),

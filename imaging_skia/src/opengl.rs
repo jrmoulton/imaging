@@ -20,8 +20,7 @@ use raw_window_handle::{RawDisplayHandle, WindowsDisplayHandle, XlibDisplayHandl
 use skia_safe as sk;
 
 use crate::{
-    Error, SkiaRenderer, color_space_for_wgpu_texture_format, color_type_for_wgpu_texture_format,
-    ganesh::GaneshBackend,
+    Error, SkiaGpuTargetRenderer, color_type_for_wgpu_texture_format, ganesh::GaneshBackend,
 };
 
 #[derive(Debug)]
@@ -118,7 +117,7 @@ impl OpenGlBackend {
 }
 
 #[cfg(feature = "wgpu")]
-impl SkiaRenderer {
+impl SkiaGpuTargetRenderer {
     /// Create a renderer that draws into a caller-owned OpenGL or GLES texture.
     ///
     /// This is the explicit GL interop path for integrations where the application already owns the
@@ -150,7 +149,7 @@ impl SkiaRenderer {
             Error::CreateGpuContext("unable to create Skia OpenGL context"),
         )?;
         let mut backend = GaneshBackend::ExternalGl(context);
-        let surface = create_wrapped_gl_surface(
+        let _surface = create_wrapped_gl_surface(
             backend.direct_context(),
             width,
             height,
@@ -158,7 +157,7 @@ impl SkiaRenderer {
             texture_target,
             texture_id,
         )?;
-        Ok(Self::from_backend_surface(backend, surface))
+        Ok(Self::from_backend(backend))
     }
 
     /// Retarget the renderer to a different caller-owned OpenGL or GLES texture.
@@ -179,24 +178,22 @@ impl SkiaRenderer {
     ) -> Result<(), Error> {
         let width = i32::from(width);
         let height = i32::from(height);
-        self.backend.ensure_current()?;
-        self.backend.flush_surface(&mut self.surface);
-        let surface = create_wrapped_gl_surface(
-            self.backend.direct_context(),
+        self.state.backend.ensure_current()?;
+        let _surface = create_wrapped_gl_surface(
+            self.state.backend.direct_context(),
             width,
             height,
             texture_format,
             texture_target,
             texture_id,
         )?;
-        self.surface = surface;
         Ok(())
     }
 }
 
 #[cfg(feature = "wgpu")]
 /// Wrap a caller-owned GL texture in a Skia surface for direct rendering.
-fn create_wrapped_gl_surface(
+pub(crate) fn create_wrapped_gl_surface(
     context: &mut sk::gpu::DirectContext,
     width: i32,
     height: i32,
@@ -223,7 +220,7 @@ fn create_wrapped_gl_surface(
         sk::gpu::SurfaceOrigin::TopLeft,
         None,
         color_type_for_wgpu_texture_format(texture_format)?,
-        color_space_for_wgpu_texture_format(texture_format),
+        None,
         None,
     )
     .ok_or(Error::CreateGpuSurface)
