@@ -13,6 +13,9 @@
 //! In UI integrations, the host application should usually own the `wgpu` device, queue, and
 //! presentation targets, then pass those handles into [`VelloHybridRenderer`].
 //!
+//! Scene-backed [`imaging::SceneImage`] brushes are supported by rasterizing the retained scene to
+//! a cached image, then uploading that image into the hybrid atlas.
+//!
 //! Recorded scenes with inline image brushes are uploaded through a renderer-scoped image registry
 //! and translated to backend-managed opaque image ids. Use [`VelloHybridSceneSink::with_renderer`]
 //! when recording directly into a native [`vello_hybrid::Scene`] and you want the same image
@@ -102,7 +105,7 @@
 //!         width: 2,
 //!         height: 2,
 //!     };
-//!     let brush = Brush::Image(ImageBrush::new(image));
+//!     let brush = Brush::Image(ImageBrush::from(image));
 //!
 //!     # let device: imaging_vello_hybrid::wgpu::Device = todo!();
 //!     # let queue: imaging_vello_hybrid::wgpu::Queue = todo!();
@@ -185,10 +188,6 @@ pub use scene_sink::VelloHybridSceneSink;
 pub enum Error {
     /// The scene is invalid (unbalanced stacks).
     InvalidScene(ValidateError),
-    /// An image brush was encountered on a sink path that has no renderer-backed image resolver.
-    UnsupportedImageBrush,
-    /// Masks are not supported by this backend yet.
-    UnsupportedMask,
     /// Vello hybrid returned a render error.
     Render(RenderError),
     /// An internal invariant was violated.
@@ -260,6 +259,7 @@ impl VelloHybridRendererState {
             &mut self.renderer,
             &self.device,
             &self.queue,
+            self.tolerance,
             encoder,
         )
     }
@@ -600,7 +600,6 @@ fn map_texture_to_image_error(error: TextureRendererError) -> ImageRendererError
                 ))
             }
         },
-        TextureRendererError::Unsupported(error) => ImageRendererError::Unsupported(error),
         TextureRendererError::Backend(error) => ImageRendererError::Backend(error),
     }
 }
@@ -627,7 +626,9 @@ fn map_readback_image_error(error: ReadbackError) -> ImageRendererError {
 mod tests {
     use super::*;
     use imaging::{
-        BlurredRoundedRect, Composite, Filter, Painter, record::Scene, render::ImageTargetError,
+        BlurredRoundedRect, Brush as ImagingBrush, Composite, Filter,
+        ImageBrush as ImagingImageBrush, Painter, SceneImage, ScenePicture, record::Scene,
+        render::ImageTargetError,
     };
     use kurbo::{Affine, Rect};
     use peniko::{Blob, Brush, Color, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
@@ -893,7 +894,7 @@ mod tests {
             width: 2,
             height: 2,
         };
-        let brush = Brush::Image(ImageBrush::new(image));
+        let brush = Brush::Image(ImageBrush::from(image));
 
         let mut scene = Scene::new();
         {
@@ -909,6 +910,51 @@ mod tests {
         assert_eq!(image.width, 20);
         assert_eq!(image.height, 20);
     }
+    #[test]
+    fn scene_image_brush_renders() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloHybridRenderer::new(device, queue);
+
+        let source = solid_scene(Color::from_rgb8(0x12, 0x34, 0x56), 2.0, 2.0);
+        let brush = ImagingBrush::Image(ImagingImageBrush::from(SceneImage::new(source, 2, 2)));
+
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter.fill(Rect::new(0.0, 0.0, 20.0, 20.0), &brush).draw();
+        }
+
+        let native = renderer.encode_scene(&scene, 20, 20).unwrap();
+        let image = renderer.render(&native, 20, 20).unwrap();
+        assert_eq!(image.width, 20);
+        assert_eq!(image.height, 20);
+    }
+
+    #[test]
+    fn scene_picture_draw_renders() {
+        let Ok((device, queue)) = try_init_device_and_queue() else {
+            return;
+        };
+        let mut renderer = VelloHybridRenderer::new(device, queue);
+
+        let picture = ScenePicture::new(
+            solid_scene(Color::from_rgb8(0xaa, 0x44, 0x22), 8.0, 8.0),
+            Rect::new(0.0, 0.0, 8.0, 8.0),
+        );
+        let mut scene = Scene::new();
+        {
+            let mut painter = Painter::new(&mut scene);
+            painter.draw_scene_picture(&picture, Affine::IDENTITY);
+        }
+
+        let native = renderer.encode_scene(&scene, 8, 8).unwrap();
+        let image = renderer.render(&native, 8, 8).unwrap();
+        assert_eq!(image.width, 8);
+        assert_eq!(image.height, 8);
+    }
+
     #[test]
     fn blurred_rounded_rect_blurs_beyond_source_rect() {
         let Ok((device, queue)) = try_init_device_and_queue() else {

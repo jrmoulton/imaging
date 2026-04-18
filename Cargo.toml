@@ -96,3 +96,5 @@ strip = "debuginfo"
 
 [profile.ci.package."*"]
 debug-assertions = true
+
+
