@@ -16,6 +16,7 @@ kurbo = { default-features = true, workspace = true }
 peniko = { default-features = true, workspace = true }
 vello_common = { default-features = true, version = "0.0.7" }
 vello_hybrid = { default-features = true, version = "0.0.7" }
+glifo = { path = "../../vello/glifo", default-features = true }
 wgpu = { default-features = false, features = [
     "std",
     "wgsl",

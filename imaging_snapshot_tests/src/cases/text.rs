@@ -85,7 +85,7 @@ impl SnapshotCase for GmGlyphRunsEmbolden {
     }
 
     fn supports_backend(&self, backend: &str) -> bool {
-        backend == "tiny_skia"
+        backend == "tiny_skia" || backend == "vello_hybrid"
     }
 
     fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {

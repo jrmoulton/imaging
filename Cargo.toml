@@ -97,4 +97,7 @@ strip = "debuginfo"
 [profile.ci.package."*"]
 debug-assertions = true
 
-
+[patch.crates-io]
+kurbo = { path = "../kurbo/kurbo" }
+vello_common = { path = "../vello/sparse_strips/vello_common" }
+vello_hybrid = { path = "../vello/sparse_strips/vello_hybrid" }

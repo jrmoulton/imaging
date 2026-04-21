@@ -36,6 +36,7 @@ impl HybridImageRegistry {
     pub(crate) fn begin_upload_session<'a>(
         &'a mut self,
         renderer: &'a mut vello_hybrid::Renderer,
+        resources: &'a mut vello_hybrid::Resources,
         device: &'a wgpu::Device,
         queue: &'a wgpu::Queue,
         tolerance: f64,
@@ -47,11 +48,12 @@ impl HybridImageRegistry {
         // and the exact memory usage isn't as important. While doing it at resolve time
         // can lead to situations where we evict something from the same session,
         // which would mean dangling image references in draw calls.
-        self.evict_to_budget(renderer, device, queue, &mut encoder);
+        self.evict_to_budget(renderer, resources, device, queue, &mut encoder);
 
         HybridImageUploadSession {
             registry: self,
             renderer,
+            resources,
             device,
             queue,
             tolerance,
@@ -75,6 +77,7 @@ impl HybridImageRegistry {
     fn evict_to_budget(
         &mut self,
         renderer: &mut vello_hybrid::Renderer,
+        resources: &mut vello_hybrid::Resources,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
@@ -84,19 +87,20 @@ impl HybridImageRegistry {
                 break;
             };
             self.bytes_used = self.bytes_used.saturating_sub(oldest.bytes);
-            renderer.destroy_image(device, queue, encoder, oldest.id);
+            renderer.destroy_image(resources, device, queue, encoder, oldest.id);
         }
     }
 
     pub(crate) fn clear(
         &mut self,
         renderer: &mut vello_hybrid::Renderer,
+        resources: &mut vello_hybrid::Resources,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
     ) {
         for image in self.live.drain(..) {
-            renderer.destroy_image(device, queue, encoder, image.id);
+            renderer.destroy_image(resources, device, queue, encoder, image.id);
         }
         self.bytes_used = 0;
     }
@@ -105,6 +109,7 @@ impl HybridImageRegistry {
 pub(crate) struct HybridImageUploadSession<'a> {
     registry: &'a mut HybridImageRegistry,
     renderer: &'a mut vello_hybrid::Renderer,
+    resources: &'a mut vello_hybrid::Resources,
     device: &'a wgpu::Device,
     queue: &'a wgpu::Queue,
     tolerance: f64,
@@ -113,6 +118,10 @@ pub(crate) struct HybridImageUploadSession<'a> {
 }
 
 impl HybridImageUploadSession<'_> {
+    pub(crate) fn resources_mut(&mut self) -> &mut vello_hybrid::Resources {
+        self.resources
+    }
+
     pub(crate) fn realize_scene_image(
         &mut self,
         scene_image: &SceneImage,
@@ -186,6 +195,7 @@ impl HybridImageUploadSession<'_> {
                 ));
             };
             let id = self.renderer.upload_image(
+                self.resources,
                 self.device,
                 self.queue,
                 self.encoder
@@ -221,6 +231,7 @@ impl HybridImageUploadSession<'_> {
         } else {
             for image in self.pending.drain(..) {
                 self.renderer.destroy_image(
+                    self.resources,
                     self.device,
                     self.queue,
                     self.encoder

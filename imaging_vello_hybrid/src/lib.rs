@@ -164,7 +164,7 @@ mod image_registry;
 mod scene_sink;
 mod wgpu_support;
 
-use image_registry::{HybridImageRegistry, HybridImageUploadSession};
+use image_registry::HybridImageRegistry;
 use imaging::RgbaImage;
 use imaging::record::{Scene, ValidateError, replay};
 use imaging::render::{
@@ -205,6 +205,7 @@ impl core::error::Error for Error {}
 #[derive(Debug)]
 pub(crate) struct VelloHybridRendererState {
     renderer: vello_hybrid::Renderer,
+    resources: vello_hybrid::Resources,
     device: wgpu::Device,
     queue: wgpu::Queue,
     tolerance: f64,
@@ -241,27 +242,12 @@ impl VelloHybridRendererState {
 
         Self {
             renderer,
+            resources: vello_hybrid::Resources::new(),
             device,
             queue,
             tolerance: 0.1,
             image_registry: HybridImageRegistry::default(),
         }
-    }
-
-    pub(crate) fn begin_image_upload_session(
-        &mut self,
-        label: &'static str,
-    ) -> HybridImageUploadSession<'_> {
-        let encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor { label: Some(label) });
-        self.image_registry.begin_upload_session(
-            &mut self.renderer,
-            &self.device,
-            &self.queue,
-            self.tolerance,
-            encoder,
-        )
     }
 
     fn clear_cached_images(&mut self) {
@@ -271,7 +257,13 @@ impl VelloHybridRendererState {
                 label: Some("imaging_vello_hybrid clear cached images"),
             });
         self.image_registry
-            .clear(&mut self.renderer, &self.device, &self.queue, &mut encoder);
+            .clear(
+                &mut self.renderer,
+                &mut self.resources,
+                &self.device,
+                &self.queue,
+                &mut encoder,
+            );
         self.queue.submit([encoder.finish()]);
     }
 
@@ -293,6 +285,7 @@ impl VelloHybridRendererState {
         self.renderer
             .render(
                 scene,
+                &mut self.resources,
                 &self.device,
                 &self.queue,
                 &mut encoder,
@@ -325,14 +318,6 @@ impl VelloHybridRenderer {
     pub fn clear_cached_images(&mut self) {
         self.state.clear_cached_images();
     }
-
-    pub(crate) fn begin_image_upload_session(
-        &mut self,
-        label: &'static str,
-    ) -> HybridImageUploadSession<'_> {
-        self.state.begin_image_upload_session(label)
-    }
-
     /// Lower a semantic [`imaging::record::Scene`] into a native [`vello_hybrid::Scene`].
     pub fn encode_scene(
         &mut self,
