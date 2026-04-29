@@ -265,6 +265,8 @@ pub struct GlyphRun {
     pub glyphs: Vec<Glyph>,
     /// Brush used for the run.
     pub brush: Brush,
+    /// Optional transform from glyph-run local coordinates into brush coordinates.
+    pub brush_transform: Option<Affine>,
     /// Per-draw compositing.
     pub composite: Composite,
 }
@@ -284,6 +286,7 @@ impl GlyphRun {
             style: Style::Fill(Fill::NonZero),
             glyphs: Vec::new(),
             brush: Brush::Solid(peniko::Color::BLACK),
+            brush_transform: None,
             composite: Composite::default(),
         }
     }
@@ -936,6 +939,7 @@ mod tests {
                 y: 0.0,
             }],
             brush: Brush::Solid(peniko::Color::BLACK),
+            brush_transform: None,
             composite: Composite::default(),
         }));
         a.draw(Draw::BlurredRoundedRect(BlurredRoundedRect {

@@ -1104,6 +1104,7 @@ dependencies = [
  "imaging_vello",
  "imaging_vello_cpu",
  "imaging_vello_hybrid",
+ "imaging_wgpu",
  "kompari",
  "kurbo",
  "peniko",

@@ -225,6 +225,7 @@ where
             hint: false,
             normalized_coords: &[],
             brush: brush.into(),
+            brush_transform: None,
             composite: Composite::default(),
         }
     }
@@ -906,6 +907,7 @@ pub struct GlyphRunBuilder<'a, S: ?Sized> {
     hint: bool,
     normalized_coords: &'a [NormalizedCoord],
     brush: BrushRef<'a>,
+    brush_transform: Option<Affine>,
     composite: Composite,
 }
 
@@ -949,6 +951,12 @@ where
         self
     }
 
+    /// Set the transform from glyph-run local coordinates into brush coordinates.
+    pub fn brush_transform(mut self, brush_transform: Option<Affine>) -> Self {
+        self.brush_transform = brush_transform;
+        self
+    }
+
     /// Set the per-draw compositing state.
     pub fn composite(mut self, composite: Composite) -> Self {
         self.composite = composite;
@@ -973,6 +981,7 @@ where
                 normalized_coords: self.normalized_coords,
                 style,
                 brush: self.brush,
+                brush_transform: self.brush_transform,
                 composite: self.composite,
             },
             &mut glyphs,

@@ -27,12 +27,13 @@ workspace = true
 
 [dev-dependencies]
 kompari = { git = "https://github.com/linebender/kompari.git", rev = "4b851413e1b17307064aa48c50e59d7e29656543" }
+imaging_wgpu = { features = ["wgpu-28"], workspace = true }
 pollster = "0.4.0"
 
 [features]
 default = []
 vello_cpu = ["dep:imaging_vello_cpu"]
-skia = ["dep:imaging_skia"]
+skia = ["dep:imaging_skia", "imaging_skia/gpu"]
 tiny_skia = ["dep:imaging_tiny_skia"]
 vello_hybrid = ["dep:imaging_vello_hybrid", "dep:vello_hybrid"]
 vello = ["dep:imaging_vello"]

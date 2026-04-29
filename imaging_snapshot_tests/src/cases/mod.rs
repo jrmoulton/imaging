@@ -19,6 +19,7 @@ mod util;
 use imaging::{PaintSink, record::Scene};
 
 pub use self::util::{DEFAULT_HEIGHT, DEFAULT_WIDTH};
+pub use images::{EXTERNAL_IMAGE_BRUSH_ID, EXTERNAL_IMAGE_BRUSH_PIXELS, EXTERNAL_IMAGE_BRUSH_SIZE};
 
 fn case_filter_patterns() -> Vec<String> {
     let Ok(value) = std::env::var("IMAGING_CASE") else {
@@ -101,6 +102,7 @@ pub const CASES: &[&dyn SnapshotCase] = &[
     &gradients::GmGradientsSweep,
     &gradients::GmGradientsTwoPointRadial,
     &images::GmImageBrushes,
+    &images::GmExternalImageBrush,
     &masks::GmMaskAlpha,
     &masks::GmMaskLuminance,
     &clips::GmClipNonIsolated,

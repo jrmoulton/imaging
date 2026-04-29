@@ -30,6 +30,30 @@ pub use wgpu_27 as wgpu;
 #[cfg(feature = "wgpu-28")]
 pub use wgpu_28 as wgpu;
 
+/// Resolved GPU image backing for an [`imaging::ExternalImage`].
+#[derive(Clone, Debug)]
+pub struct ResolvedExternalImage {
+    /// Source texture.
+    pub texture: wgpu::Texture,
+    /// Source texture view.
+    pub view: wgpu::TextureView,
+    /// Source texture format.
+    pub format: wgpu::TextureFormat,
+    /// Source image width in pixels.
+    pub width: u32,
+    /// Source image height in pixels.
+    pub height: u32,
+}
+
+/// Renderer-specific resolver for [`imaging::ExternalImage`] resources.
+pub trait ExternalImageResolver {
+    /// Resolve an external image id to a GPU texture/view pair.
+    fn resolve_external_image(
+        &mut self,
+        image: imaging::ExternalImage,
+    ) -> Option<ResolvedExternalImage>;
+}
+
 /// Shared `wgpu` texture-view render target used by view-based [`TextureRenderer`] backends.
 #[derive(Clone, Debug)]
 pub struct TextureViewTarget {
@@ -156,6 +180,22 @@ pub trait TextureRenderer: ImageRenderer {
         source: &mut dyn RenderSource,
         target: Self::TextureTarget,
     ) -> Result<(), TextureRendererError>;
+
+    /// Render a source that may contain external image brushes into a caller-provided texture
+    /// target.
+    ///
+    /// Backends that cannot resolve external images should keep the default implementation and
+    /// fail loudly instead of silently dropping the image.
+    fn render_source_into_texture_with_external_images(
+        &mut self,
+        _source: &mut dyn RenderSource,
+        _target: Self::TextureTarget,
+        _resolver: &mut dyn ExternalImageResolver,
+    ) -> Result<(), TextureRendererError> {
+        Err(TextureRendererError::Target(
+            TextureTargetError::InvalidTarget("renderer does not support external images"),
+        ))
+    }
 
     /// Render a source and return a backend-owned texture.
     fn render_source_texture(

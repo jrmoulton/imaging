@@ -75,6 +75,42 @@ impl MetalBackend {
         .ok_or(Error::CreateGpuSurface)
     }
 
+    pub(crate) fn wrap_texture_as_image(
+        &mut self,
+        texture: &wgpu::Texture,
+        alpha_type: sk::AlphaType,
+    ) -> Result<sk::Image, Error> {
+        let width = i32::try_from(texture.width())
+            .map_err(|_| Error::Internal("texture width overflow"))?;
+        let height = i32::try_from(texture.height())
+            .map_err(|_| Error::Internal("texture height overflow"))?;
+        let format = texture.format();
+        let hal_texture = unsafe {
+            texture
+                .as_hal::<wgpu::hal::api::Metal>()
+                .ok_or(Error::CreateGpuSurface)?
+        };
+        let texture_info =
+            unsafe { sk::gpu::mtl::TextureInfo::new(hal_texture.raw_handle().as_ptr() as _) };
+        let backend_texture = unsafe {
+            sk::gpu::backend_textures::make_mtl(
+                (width, height),
+                sk::gpu::Mipmapped::No,
+                &texture_info,
+                "imaging_skia external metal texture",
+            )
+        };
+        sk::Image::from_texture(
+            self.direct_context(),
+            &backend_texture,
+            sk::gpu::SurfaceOrigin::TopLeft,
+            color_type_for_wgpu_texture_format(format)?,
+            alpha_type,
+            color_space_for_wgpu_texture_format(format),
+        )
+        .ok_or(Error::CreateGpuSurface)
+    }
+
     pub(crate) fn supports_texture_format(
         texture_format: wgpu::TextureFormat,
     ) -> Result<(), Error> {

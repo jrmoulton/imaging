@@ -472,6 +472,13 @@ where
                     });
                 }
             }
+            ImageRef::External(image) => {
+                if image.width == 0 || image.height == 0 {
+                    return !self.violate(ValidationError::InvalidBrush {
+                        what: "Brush::Image::external_size",
+                    });
+                }
+            }
         }
 
         true
@@ -485,6 +492,9 @@ where
         let ok = self.validate_affine("GlyphRun::transform", &glyph_run.transform)
             && glyph_run.glyph_transform.as_ref().is_none_or(|transform| {
                 self.validate_affine("GlyphRun::glyph_transform", transform)
+            })
+            && glyph_run.brush_transform.as_ref().is_none_or(|transform| {
+                self.validate_affine("GlyphRun::brush_transform", transform)
             })
             && font_size_ok
             && glyphs_ok
@@ -713,7 +723,7 @@ where
 mod tests {
     use super::*;
     use crate::{
-        ClipRef, Composite, FillRef, GlyphRunRef,
+        ClipRef, Composite, ExternalImage, ExternalImageId, FillRef, GlyphRunRef,
         record::{Geometry, Glyph, Scene},
     };
     use alloc::sync::Arc;
@@ -815,6 +825,7 @@ mod tests {
                 normalized_coords: &[],
                 style: &style,
                 brush: (&paint).into(),
+                brush_transform: None,
                 composite: Composite::default(),
             },
             &mut glyphs.into_iter(),
@@ -886,6 +897,28 @@ mod tests {
             sink.first_error(),
             Some(&ValidationError::InvalidBrush {
                 what: "Brush::Image::data_len",
+            })
+        );
+    }
+
+    #[test]
+    fn external_image_brushes_validate_size() {
+        let inner = Scene::new();
+        let mut sink = ValidatingSink::new(inner);
+        let paint = crate::Brush::Image(crate::ImageBrush::from(ExternalImage::new(
+            ExternalImageId(7),
+            0,
+            4,
+            ImageAlphaType::AlphaPremultiplied,
+        )));
+        sink.fill(FillRef::new(
+            Geometry::Rect(Rect::new(0.0, 0.0, 10.0, 10.0)),
+            &paint,
+        ));
+        assert_eq!(
+            sink.first_error(),
+            Some(&ValidationError::InvalidBrush {
+                what: "Brush::Image::external_size",
             })
         );
     }

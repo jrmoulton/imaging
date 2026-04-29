@@ -1,6 +1,10 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+#[cfg(feature = "gpu")]
+use super::GaneshBackend;
+#[cfg(feature = "gpu")]
+use super::alpha_type_for_image_alpha_type;
 use super::{
     Error, ImageCache, PictureCache, SkiaFontCache, affine_to_matrix, apply_stroke_style,
     bez_to_sk_path, brush_to_paint, build_filter_chain, f64_to_f32, geometry_to_bez_path,
@@ -11,6 +15,8 @@ use imaging::{
     StrokeRef,
     record::{self, replay, replay_transformed},
 };
+#[cfg(feature = "gpu")]
+use imaging_wgpu::{ExternalImageResolver, ResolvedExternalImage};
 use kurbo::{Affine, Rect, Shape as _};
 use skia_safe as sk;
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
@@ -302,6 +308,7 @@ fn draw_glyph_run(
     image_cache: Option<&Rc<RefCell<ImageCache>>>,
     picture_cache: Option<&Rc<RefCell<PictureCache>>>,
     font_cache: Option<&SkiaFontCache>,
+    #[cfg(feature = "gpu")] external_images: Option<&mut ExternalImageRenderContext<'_>>,
     glyph_run: GlyphRunRef<'_>,
     glyphs: &mut dyn Iterator<Item = record::Glyph>,
 ) {
@@ -315,9 +322,11 @@ fn draw_glyph_run(
     let Some(mut sk_paint) = brush_to_paint(
         glyph_run.brush,
         glyph_run.composite.alpha,
-        Affine::IDENTITY,
+        glyph_run.brush_transform.unwrap_or(Affine::IDENTITY),
         image_cache,
         picture_cache,
+        #[cfg(feature = "gpu")]
+        external_images,
     ) else {
         state.set_error_once(Error::Internal("invalid image brush"));
         return;
@@ -701,6 +710,7 @@ fn paint_sink_fill(
     state: &mut StreamState,
     image_cache: Option<&Rc<RefCell<ImageCache>>>,
     picture_cache: Option<&Rc<RefCell<PictureCache>>>,
+    #[cfg(feature = "gpu")] external_images: Option<&mut ExternalImageRenderContext<'_>>,
     draw: FillRef<'_>,
 ) {
     if state.error.is_some() {
@@ -718,6 +728,8 @@ fn paint_sink_fill(
         draw.brush_transform.unwrap_or(Affine::IDENTITY),
         image_cache,
         picture_cache,
+        #[cfg(feature = "gpu")]
+        external_images,
     ) else {
         state.set_error_once(Error::Internal("invalid image brush"));
         return;
@@ -759,6 +771,7 @@ fn paint_sink_stroke(
     state: &mut StreamState,
     image_cache: Option<&Rc<RefCell<ImageCache>>>,
     picture_cache: Option<&Rc<RefCell<PictureCache>>>,
+    #[cfg(feature = "gpu")] external_images: Option<&mut ExternalImageRenderContext<'_>>,
     draw: StrokeRef<'_>,
 ) {
     if state.error.is_some() {
@@ -776,6 +789,8 @@ fn paint_sink_stroke(
         draw.brush_transform.unwrap_or(Affine::IDENTITY),
         image_cache,
         picture_cache,
+        #[cfg(feature = "gpu")]
+        external_images,
     ) else {
         state.set_error_once(Error::Internal("invalid image brush"));
         return;
@@ -816,7 +831,41 @@ pub struct SkCanvasSink<'a> {
     picture_cache: Option<Rc<RefCell<PictureCache>>>,
     mask_cache: Option<Rc<RefCell<MaskCache>>>,
     font_cache: Option<SkiaFontCache>,
+    #[cfg(feature = "gpu")]
+    external_images: Option<ExternalImageRenderContext<'a>>,
     state: StreamState,
+}
+
+#[cfg(feature = "gpu")]
+pub(crate) struct ExternalImageRenderContext<'a> {
+    pub backend: &'a mut GaneshBackend,
+    pub resolver: &'a mut dyn ExternalImageResolver,
+    retained: Vec<ResolvedExternalImage>,
+    retained_images: Vec<sk::Image>,
+}
+
+#[cfg(feature = "gpu")]
+impl ExternalImageRenderContext<'_> {
+    pub(crate) fn external_image_shader(
+        &mut self,
+        image: imaging::ExternalImage,
+        tile_modes: Option<(sk::TileMode, sk::TileMode)>,
+        sampling: sk::SamplingOptions,
+        local_matrix: &sk::Matrix,
+    ) -> Option<sk::Shader> {
+        let resolved = self.resolver.resolve_external_image(image)?;
+        let sk_image = self
+            .backend
+            .wrap_texture_as_image(
+                &resolved.texture,
+                alpha_type_for_image_alpha_type(image.alpha_type),
+            )
+            .ok()?;
+        let shader = sk_image.to_shader(tile_modes, sampling, Some(local_matrix));
+        self.retained.push(resolved);
+        self.retained_images.push(sk_image);
+        shader
+    }
 }
 
 impl core::fmt::Debug for SkCanvasSink<'_> {
@@ -839,6 +888,8 @@ impl<'a> SkCanvasSink<'a> {
             picture_cache: None,
             mask_cache: None,
             font_cache: None,
+            #[cfg(feature = "gpu")]
+            external_images: None,
             state: StreamState::new(),
         }
     }
@@ -856,8 +907,24 @@ impl<'a> SkCanvasSink<'a> {
             picture_cache: Some(picture_cache),
             mask_cache: Some(mask_cache),
             font_cache: Some(font_cache),
+            #[cfg(feature = "gpu")]
+            external_images: None,
             state: StreamState::new(),
         }
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(crate) fn set_external_images(
+        &mut self,
+        backend: &'a mut GaneshBackend,
+        resolver: &'a mut dyn ExternalImageResolver,
+    ) {
+        self.external_images = Some(ExternalImageRenderContext {
+            backend,
+            resolver,
+            retained: Vec::new(),
+            retained_images: Vec::new(),
+        });
     }
 
     /// Set the tolerance used when converting rounded rectangles to paths.
@@ -901,6 +968,8 @@ impl PaintSink for SkCanvasSink<'_> {
             &mut self.state,
             self.image_cache.as_ref(),
             self.picture_cache.as_ref(),
+            #[cfg(feature = "gpu")]
+            self.external_images.as_mut(),
             draw,
         );
     }
@@ -911,6 +980,8 @@ impl PaintSink for SkCanvasSink<'_> {
             &mut self.state,
             self.image_cache.as_ref(),
             self.picture_cache.as_ref(),
+            #[cfg(feature = "gpu")]
+            self.external_images.as_mut(),
             draw,
         );
     }
@@ -933,6 +1004,8 @@ impl PaintSink for SkCanvasSink<'_> {
             self.image_cache.as_ref(),
             self.picture_cache.as_ref(),
             self.font_cache.as_ref(),
+            #[cfg(feature = "gpu")]
+            self.external_images.as_mut(),
             draw,
             glyphs,
         );
@@ -1095,6 +1168,8 @@ impl PaintSink for SkPictureRecorderSink {
             state,
             self.image_cache.as_ref(),
             self.picture_cache.as_ref(),
+            #[cfg(feature = "gpu")]
+            None,
             draw,
         );
     }
@@ -1111,6 +1186,8 @@ impl PaintSink for SkPictureRecorderSink {
             state,
             self.image_cache.as_ref(),
             self.picture_cache.as_ref(),
+            #[cfg(feature = "gpu")]
+            None,
             draw,
         );
     }
@@ -1139,6 +1216,8 @@ impl PaintSink for SkPictureRecorderSink {
             self.image_cache.as_ref(),
             self.picture_cache.as_ref(),
             self.font_cache.as_ref(),
+            #[cfg(feature = "gpu")]
+            None,
             draw,
             glyphs,
         );

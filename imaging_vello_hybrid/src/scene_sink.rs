@@ -341,7 +341,10 @@ impl<'a> VelloHybridSceneSink<'a> {
             PaintMode::Mask(mode) => mask_color(draw.color, mode),
         };
         self.scene.set_paint(Brush::Solid(color));
-        let path = draw.rect.to_rounded_rect(draw.radius).to_path(self.tolerance);
+        let path = draw
+            .rect
+            .to_rounded_rect(draw.radius)
+            .to_path(self.tolerance);
         self.scene.fill_path(&path);
         self.scene.pop_layer();
     }

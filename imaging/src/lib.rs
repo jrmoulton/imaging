@@ -160,8 +160,8 @@ pub mod render;
 pub mod validation;
 
 pub use image::{
-    Brush, BrushRef, Image, ImageBrush, ImageBrushRef, ImageRef, SceneImage, SceneImageWeak,
-    ScenePicture, ScenePictureWeak,
+    Brush, BrushRef, ExternalImage, ExternalImageId, Image, ImageBrush, ImageBrushRef, ImageRef,
+    SceneImage, SceneImageWeak, ScenePicture, ScenePictureWeak,
 };
 pub use paint::{
     AppliedMaskRef, ClipRef, ContextRef, DrawRef, FillRef, GeometryRef, GlyphRunRef, GroupRef,

@@ -582,6 +582,8 @@ pub struct GlyphRunRef<'a> {
     pub style: &'a Style,
     /// Brush used for the run.
     pub brush: BrushRef<'a>,
+    /// Optional transform from glyph-run local coordinates into brush coordinates.
+    pub brush_transform: Option<Affine>,
     /// Per-draw compositing.
     pub composite: Composite,
 }
@@ -612,6 +614,7 @@ impl<'a> GlyphRunRef<'a> {
             normalized_coords: &[],
             style,
             brush: brush.into(),
+            brush_transform: None,
             composite: Composite::default(),
         }
     }
@@ -630,6 +633,7 @@ impl<'a> GlyphRunRef<'a> {
             style: self.style.clone(),
             glyphs: glyphs.into_iter().collect(),
             brush: self.brush.to_owned(),
+            brush_transform: self.brush_transform,
             composite: self.composite,
         }
     }
@@ -842,6 +846,7 @@ impl GlyphRun {
             normalized_coords: &self.normalized_coords,
             style: &self.style,
             brush: (&self.brush).into(),
+            brush_transform: self.brush_transform,
             composite: self.composite,
         }
     }
@@ -1180,6 +1185,7 @@ mod tests {
                 y: 0.0,
             }],
             brush: Brush::Solid(peniko::Color::BLACK),
+            brush_transform: None,
             composite: Composite::default(),
         }));
         let blur_id = source.draw(Draw::BlurredRoundedRect(BlurredRoundedRect {

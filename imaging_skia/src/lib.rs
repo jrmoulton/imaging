@@ -197,7 +197,9 @@ use crate::gpu_readback::{
     ReadbackError, ScratchTexture, read_texture_into, read_texture_into_target,
 };
 #[cfg(feature = "gpu")]
-use imaging_wgpu::{TextureRenderer, TextureRendererError, TextureTargetError};
+use imaging_wgpu::{
+    ExternalImageResolver, TextureRenderer, TextureRendererError, TextureTargetError,
+};
 use sinks::MaskCache;
 pub use sinks::{SkCanvasSink, SkPictureRecorderSink};
 #[cfg(feature = "gpu")]
@@ -948,6 +950,33 @@ impl SkiaGpuRendererState {
         Ok(())
     }
 
+    fn render_source_into_texture_with_external_images(
+        &mut self,
+        source: &mut dyn RenderSource,
+        texture: &wgpu::Texture,
+        resolver: &mut dyn ExternalImageResolver,
+    ) -> Result<(), Error> {
+        let _ = Self::checked_texture_size(texture)?;
+        source.validate().map_err(Error::InvalidScene)?;
+        let mut surface = self.backend.wrap_texture(texture)?;
+        surface.canvas().clear(sk::Color::TRANSPARENT);
+        {
+            let mut sink = SkCanvasSink::new_with_caches(
+                surface.canvas(),
+                Some(self.caches.image_cache()),
+                self.caches.picture_cache(),
+                self.caches.mask_cache(),
+                self.caches.font_cache(),
+            );
+            sink.set_tolerance(self.tolerance);
+            sink.set_external_images(&mut self.backend, resolver);
+            source.paint_into(&mut sink);
+            sink.finish()?;
+        }
+        self.backend.flush_surface(&mut surface);
+        Ok(())
+    }
+
     fn render_picture_to_texture_for_readback(
         &mut self,
         picture: &sk::Picture,
@@ -1039,6 +1068,17 @@ impl SkiaRenderer {
     ) -> Result<(), Error> {
         self.state.render_picture_to_texture(picture, texture)
     }
+
+    /// Render a source containing external image brushes into a caller-owned `wgpu::Texture`.
+    pub fn render_source_into_texture_with_external_images(
+        &mut self,
+        source: &mut dyn RenderSource,
+        texture: &wgpu::Texture,
+        resolver: &mut dyn ExternalImageResolver,
+    ) -> Result<(), Error> {
+        self.state
+            .render_source_into_texture_with_external_images(source, texture, resolver)
+    }
 }
 
 fn supported_image_formats() -> Vec<ImageBufferFormat> {
@@ -1074,6 +1114,17 @@ impl TextureRenderer for SkiaRenderer {
     ) -> Result<(), TextureRendererError> {
         self.state
             .render_source_into_texture(source, &target)
+            .map_err(map_texture_renderer_error)
+    }
+
+    fn render_source_into_texture_with_external_images(
+        &mut self,
+        source: &mut dyn RenderSource,
+        target: Self::TextureTarget,
+        resolver: &mut dyn ExternalImageResolver,
+    ) -> Result<(), TextureRendererError> {
+        self.state
+            .render_source_into_texture_with_external_images(source, &target, resolver)
             .map_err(map_texture_renderer_error)
     }
 
@@ -1354,6 +1405,14 @@ fn color_space_for_image_buffer_format(format: ImageBufferFormat) -> Option<sk::
             Some(sk::ColorSpace::new_srgb())
         }
         _ => None,
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn alpha_type_for_image_alpha_type(alpha_type: ImageAlphaType) -> sk::AlphaType {
+    match alpha_type {
+        ImageAlphaType::Alpha => sk::AlphaType::Unpremul,
+        ImageAlphaType::AlphaPremultiplied => sk::AlphaType::Premul,
     }
 }
 
@@ -1815,6 +1874,7 @@ fn brush_to_paint(
     paint_xf: Affine,
     image_cache: Option<&Rc<RefCell<ImageCache>>>,
     picture_cache: Option<&Rc<RefCell<PictureCache>>>,
+    #[cfg(feature = "gpu")] mut external_images: Option<&mut sinks::ExternalImageRenderContext<'_>>,
 ) -> Option<sk::Paint> {
     let mut paint = sk::Paint::default();
     paint.set_anti_alias(true);
@@ -1944,10 +2004,10 @@ fn brush_to_paint(
                     tile_modes,
                     sampling_options_from_quality(image_brush.sampler.quality),
                     Some(&affine_to_matrix(paint_xf)),
-                )?,
+                ),
                 ImageRef::Scene(scene) => {
                     let picture = skia_picture_from_scene(scene.picture(), picture_cache)?;
-                    picture.to_shader(
+                    Some(picture.to_shader(
                         tile_modes,
                         filter_mode_from_quality(image_brush.sampler.quality),
                         Some(&affine_to_matrix(paint_xf)),
@@ -1957,8 +2017,23 @@ fn brush_to_paint(
                             scene.width() as f32,
                             scene.height() as f32,
                         )),
+                    ))
+                }
+                #[cfg(feature = "gpu")]
+                ImageRef::External(image) => {
+                    let external_images = external_images.as_deref_mut()?;
+                    external_images.external_image_shader(
+                        image,
+                        tile_modes,
+                        sampling_options_from_quality(image_brush.sampler.quality),
+                        &affine_to_matrix(paint_xf),
                     )
                 }
+                #[cfg(not(feature = "gpu"))]
+                ImageRef::External(_) => None,
+            };
+            let Some(shader) = shader else {
+                return None;
             };
             paint.set_shader(shader);
             paint.set_alpha_f((image_brush.sampler.alpha * alpha_scale).clamp(0.0, 1.0));
@@ -2134,13 +2209,14 @@ fn build_filter_chain(filters: &[Filter]) -> Option<sk::ImageFilter> {
 mod tests {
     use super::*;
     use imaging::{
-        Brush, GroupRef, ImageBrush, MaskMode, Painter, SceneImage,
+        Brush, ExternalImage, ExternalImageId, GroupRef, ImageBrush, MaskMode, Painter, SceneImage,
         record::Glyph,
         render::{ImageBufferTarget, ImageTargetError},
     };
     use kurbo::Rect;
     use peniko::{
-        Blob, Color, Extend, Fill, FontData, ImageAlphaType, ImageData, ImageFormat, Style,
+        Blob, Color, Extend, Fill, FontData, ImageAlphaType, ImageData, ImageFormat, ImageQuality,
+        Style,
     };
     use std::sync::{Arc, OnceLock};
     #[cfg(feature = "gpu")]
@@ -2622,7 +2698,7 @@ mod tests {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Bgra8Unorm,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -2639,6 +2715,145 @@ mod tests {
         let mut source = &scene;
         TextureRenderer::render_source_into_texture(&mut renderer, &mut source, texture.clone())
             .unwrap();
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_renderer_resolves_external_image_brush_to_texture() {
+        struct Resolver {
+            texture: wgpu::Texture,
+            view: wgpu::TextureView,
+        }
+
+        impl ExternalImageResolver for Resolver {
+            fn resolve_external_image(
+                &mut self,
+                _image: ExternalImage,
+            ) -> Option<imaging_wgpu::ResolvedExternalImage> {
+                Some(imaging_wgpu::ResolvedExternalImage {
+                    texture: self.texture.clone(),
+                    view: self.view.clone(),
+                    format: self.texture.format(),
+                    width: self.texture.width(),
+                    height: self.texture.height(),
+                })
+            }
+        }
+
+        let Some((mut renderer, device)) = try_init_gpu_renderer_with_device() else {
+            return;
+        };
+        let source_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imaging_skia external image source"),
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        initialize_texture_for_wgpu(&device, &renderer.state.queue, &source_texture);
+        renderer.state.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &source_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[
+                0xff, 0x00, 0x00, 0xff, //
+                0x00, 0xff, 0x00, 0xff,
+            ],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(8),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 2,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .unwrap();
+        let mut uploaded = RgbaImage::new(2, 1);
+        read_texture_into(
+            &device,
+            &renderer.state.queue,
+            &source_texture,
+            2,
+            1,
+            &mut uploaded,
+        )
+        .unwrap();
+        assert_eq!(
+            &uploaded.data[..8],
+            &[
+                0xff, 0x00, 0x00, 0xff, //
+                0x00, 0xff, 0x00, 0xff,
+            ]
+        );
+        let source_view = source_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("imaging_skia external image target"),
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        let mut scene = Scene::new();
+        {
+            let image = ExternalImage::new(
+                ExternalImageId(42),
+                2,
+                1,
+                ImageAlphaType::AlphaPremultiplied,
+            );
+            let brush = Brush::Image(ImageBrush::from(image).with_quality(ImageQuality::Low));
+            let mut painter = Painter::new(&mut scene);
+            painter.fill(Rect::new(0.0, 0.0, 2.0, 1.0), &brush).draw();
+        }
+
+        let mut resolver = Resolver {
+            texture: source_texture,
+            view: source_view,
+        };
+        let mut source = &scene;
+        renderer
+            .render_source_into_texture_with_external_images(&mut source, &target, &mut resolver)
+            .unwrap();
+
+        let mut image = RgbaImage::new(2, 1);
+        read_texture_into(&device, &renderer.state.queue, &target, 2, 1, &mut image).unwrap();
+        assert_eq!(
+            &image.data[..8],
+            &[
+                0xff, 0x00, 0x00, 0xff, //
+                0x00, 0xff, 0x00, 0xff,
+            ]
+        );
     }
 
     #[cfg(feature = "gpu")]

@@ -15,6 +15,41 @@ use crate::record;
 static NEXT_SCENE_IMAGE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_SCENE_PICTURE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Stable identifier for an externally-owned image resource.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ExternalImageId(pub u64);
+
+/// Backend-neutral metadata for an externally-owned image resource.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ExternalImage {
+    /// Resource identity resolved by a renderer-specific resolver.
+    pub id: ExternalImageId,
+    /// Natural width in pixels.
+    pub width: u32,
+    /// Natural height in pixels.
+    pub height: u32,
+    /// External image alpha interpretation.
+    pub alpha_type: peniko::ImageAlphaType,
+}
+
+impl ExternalImage {
+    /// Create an external image descriptor.
+    #[must_use]
+    pub const fn new(
+        id: ExternalImageId,
+        width: u32,
+        height: u32,
+        alpha_type: peniko::ImageAlphaType,
+    ) -> Self {
+        Self {
+            id,
+            width,
+            height,
+            alpha_type,
+        }
+    }
+}
+
 /// Image payload accepted by `imaging` brushes.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Image {
@@ -22,6 +57,8 @@ pub enum Image {
     Raster(peniko::ImageData),
     /// Retained scene content with an explicit natural size.
     Scene(SceneImage),
+    /// Externally-owned image resolved by renderer-specific GPU integration.
+    External(ExternalImage),
 }
 
 impl Image {
@@ -31,6 +68,7 @@ impl Image {
         match self {
             Self::Raster(image) => image.width,
             Self::Scene(scene) => scene.width(),
+            Self::External(image) => image.width,
         }
     }
 
@@ -40,6 +78,7 @@ impl Image {
         match self {
             Self::Raster(image) => image.height,
             Self::Scene(scene) => scene.height(),
+            Self::External(image) => image.height,
         }
     }
 
@@ -49,6 +88,7 @@ impl Image {
         match self {
             Self::Raster(image) => ImageRef::Raster(image),
             Self::Scene(scene) => ImageRef::Scene(scene),
+            Self::External(image) => ImageRef::External(*image),
         }
     }
 }
@@ -65,6 +105,12 @@ impl From<SceneImage> for Image {
     }
 }
 
+impl From<ExternalImage> for Image {
+    fn from(value: ExternalImage) -> Self {
+        Self::External(value)
+    }
+}
+
 /// Borrowed image payload.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ImageRef<'a> {
@@ -72,6 +118,8 @@ pub enum ImageRef<'a> {
     Raster(&'a peniko::ImageData),
     /// Borrowed retained scene image.
     Scene(&'a SceneImage),
+    /// Borrowed external image descriptor.
+    External(ExternalImage),
 }
 
 impl ImageRef<'_> {
@@ -81,6 +129,7 @@ impl ImageRef<'_> {
         match self {
             Self::Raster(image) => image.width,
             Self::Scene(scene) => scene.width(),
+            Self::External(image) => image.width,
         }
     }
 
@@ -90,6 +139,7 @@ impl ImageRef<'_> {
         match self {
             Self::Raster(image) => image.height,
             Self::Scene(scene) => scene.height(),
+            Self::External(image) => image.height,
         }
     }
 
@@ -99,6 +149,7 @@ impl ImageRef<'_> {
         match self {
             Self::Raster(image) => Image::Raster(image.clone()),
             Self::Scene(scene) => Image::Scene(scene.clone()),
+            Self::External(image) => Image::External(image),
         }
     }
 }
@@ -118,6 +169,12 @@ impl<'a> From<&'a peniko::ImageData> for ImageRef<'a> {
 impl<'a> From<&'a SceneImage> for ImageRef<'a> {
     fn from(value: &'a SceneImage) -> Self {
         Self::Scene(value)
+    }
+}
+
+impl From<ExternalImage> for ImageRef<'_> {
+    fn from(value: ExternalImage) -> Self {
+        Self::External(value)
     }
 }
 
@@ -379,6 +436,12 @@ impl From<SceneImage> for ImageBrush {
     }
 }
 
+impl From<ExternalImage> for ImageBrush {
+    fn from(image: ExternalImage) -> Self {
+        Image::from(image).into()
+    }
+}
+
 impl From<peniko::ImageBrush> for ImageBrush {
     fn from(image: peniko::ImageBrush) -> Self {
         Self(peniko::ImageBrush {
@@ -428,6 +491,15 @@ impl<'a> From<&'a peniko::ImageData> for ImageBrushRef<'a> {
 
 impl<'a> From<&'a SceneImage> for ImageBrushRef<'a> {
     fn from(image: &'a SceneImage) -> Self {
+        Self(peniko::ImageBrush {
+            image: image.into(),
+            sampler: peniko::ImageSampler::default(),
+        })
+    }
+}
+
+impl From<ExternalImage> for ImageBrushRef<'_> {
+    fn from(image: ExternalImage) -> Self {
         Self(peniko::ImageBrush {
             image: image.into(),
             sampler: peniko::ImageSampler::default(),
@@ -578,6 +650,12 @@ impl<'a> From<&'a peniko::ImageData> for BrushRef<'a> {
 
 impl<'a> From<&'a SceneImage> for BrushRef<'a> {
     fn from(value: &'a SceneImage) -> Self {
+        Self::Image(value.into())
+    }
+}
+
+impl From<ExternalImage> for BrushRef<'_> {
+    fn from(value: ExternalImage) -> Self {
         Self::Image(value.into())
     }
 }

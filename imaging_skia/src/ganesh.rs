@@ -100,6 +100,21 @@ impl GaneshBackend {
         }
     }
 
+    pub(crate) fn wrap_texture_as_image(
+        &mut self,
+        texture: &wgpu::Texture,
+        alpha_type: sk::AlphaType,
+    ) -> Result<sk::Image, Error> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            Self::Metal(backend) => backend.wrap_texture_as_image(texture, alpha_type),
+            #[cfg(windows)]
+            Self::Dx12(_) => Err(Error::UnsupportedGpuBackend),
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            Self::Vulkan(_) => Err(Error::UnsupportedGpuBackend),
+        }
+    }
+
     pub(crate) fn supported_texture_formats(&self) -> Vec<wgpu::TextureFormat> {
         match self {
             #[cfg(any(target_os = "macos", target_os = "ios"))]

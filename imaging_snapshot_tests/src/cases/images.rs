@@ -1,7 +1,10 @@
 // Copyright 2026 the Imaging Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use imaging::{Composite, PaintSink, Painter, record::Geometry};
+use imaging::{
+    Brush as ImagingBrush, Composite, ExternalImage, ExternalImageId,
+    ImageBrush as ImagingImageBrush, PaintSink, Painter, record::Geometry,
+};
 use kurbo::{Affine, BezPath, Point, Rect, RoundedRect, Stroke};
 use peniko::{BlendMode, Brush, Color, Extend, ImageBrush, ImageQuality, Mix};
 
@@ -95,6 +98,70 @@ impl SnapshotCase for GmImageBrushes {
                     height * 0.94,
                 )),
                 &glaze,
+            )
+            .draw();
+    }
+}
+
+/// External image id used by the Skia external-image snapshot resolver.
+pub const EXTERNAL_IMAGE_BRUSH_ID: ExternalImageId = ExternalImageId(42);
+/// Pixel size of the Skia external-image snapshot source texture.
+pub const EXTERNAL_IMAGE_BRUSH_SIZE: (u32, u32) = (2, 2);
+/// RGBA8 pixels uploaded into the Skia external-image snapshot source texture.
+pub const EXTERNAL_IMAGE_BRUSH_PIXELS: &[u8] = &[
+    0xff, 0x20, 0x10, 0xff, 0x20, 0xc8, 0x40, 0xff, 0x20, 0x60, 0xff, 0xff, 0xff, 0xe0, 0x20, 0xff,
+];
+
+pub(crate) struct GmExternalImageBrush;
+impl SnapshotCase for GmExternalImageBrush {
+    fn name(&self) -> &'static str {
+        "gm_external_image_brush"
+    }
+
+    fn supports_backend(&self, backend: &str) -> bool {
+        backend == "skia"
+    }
+
+    fn run(&self, sink: &mut dyn PaintSink, width: f64, height: f64) {
+        background(sink, width, height, Color::from_rgb8(244, 244, 240));
+        let mut painter = Painter::new(sink);
+        let image = ExternalImage::new(
+            EXTERNAL_IMAGE_BRUSH_ID,
+            EXTERNAL_IMAGE_BRUSH_SIZE.0,
+            EXTERNAL_IMAGE_BRUSH_SIZE.1,
+            peniko::ImageAlphaType::AlphaPremultiplied,
+        );
+        let brush = ImagingBrush::Image(
+            ImagingImageBrush::from(image)
+                .with_extend(Extend::Reflect)
+                .with_quality(ImageQuality::Low),
+        );
+
+        painter
+            .fill(
+                Geometry::RoundedRect(RoundedRect::new(
+                    width * 0.15,
+                    height * 0.18,
+                    width * 0.85,
+                    height * 0.82,
+                    28.0,
+                )),
+                &brush,
+            )
+            .brush_transform(Some(Affine::scale_non_uniform(48.0, 32.0)))
+            .draw();
+
+        painter
+            .stroke(
+                Geometry::RoundedRect(RoundedRect::new(
+                    width * 0.15,
+                    height * 0.18,
+                    width * 0.85,
+                    height * 0.82,
+                    28.0,
+                )),
+                &Stroke::new(6.0),
+                &Brush::Solid(Color::from_rgba8(18, 28, 42, 220)),
             )
             .draw();
     }

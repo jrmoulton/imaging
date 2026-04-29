@@ -256,14 +256,13 @@ impl VelloHybridRendererState {
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("imaging_vello_hybrid clear cached images"),
             });
-        self.image_registry
-            .clear(
-                &mut self.renderer,
-                &mut self.resources,
-                &self.device,
-                &self.queue,
-                &mut encoder,
-            );
+        self.image_registry.clear(
+            &mut self.renderer,
+            &mut self.resources,
+            &self.device,
+            &self.queue,
+            &mut encoder,
+        );
         self.queue.submit([encoder.finish()]);
     }
 
