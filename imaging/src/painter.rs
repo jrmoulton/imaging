@@ -3,13 +3,13 @@
 
 //! Painter-style authoring helpers built on top of [`PaintSink`].
 
-use core::borrow::Borrow;
+use core::{borrow::Borrow, marker::PhantomData};
 
 use kurbo::{Affine, BezPath, CubicBez, Line, QuadBez, Rect, RoundedRect, Stroke, Vec2};
 use peniko::Style;
 
 use crate::{
-    BlurredRoundedRect, BrushRef, ClipRef, Composite, ContextRef, FillRef, GeometryRef,
+    BlurredRoundedRect, Brush, ClipRef, Composite, ContextRef, FillRef, Filter, GeometryRef,
     GlyphRunRef, GroupRef, ImageBrushRef, MaskMode, NormalizedCoord, PaintSink, ScenePicture,
     SourceLocationRef, StrokeRef, record,
 };
@@ -25,6 +25,22 @@ pub trait PaintShape<'a> {
     /// Convert this shape into borrowed imaging geometry.
     #[must_use]
     fn into_geometry_ref(self) -> GeometryRef<'a>;
+}
+
+/// A sink that can expose an inner retained Imaging scene.
+///
+/// Generic painters can carry toolkit-specific group payloads. Use this bridge when a subsystem
+/// needs to author retained Imaging content, such as scene pictures or scene images, with
+/// Imaging's standard [`Filter`] and [`Composite`] group payloads.
+pub trait ImagingSceneSink {
+    /// Borrow the retained Imaging scene used by this sink.
+    fn imaging_scene_mut(&mut self) -> &mut record::Scene;
+}
+
+impl ImagingSceneSink for record::Scene {
+    fn imaging_scene_mut(&mut self) -> &mut record::Scene {
+        self
+    }
 }
 
 impl<'a> PaintShape<'a> for GeometryRef<'a> {
@@ -110,18 +126,28 @@ impl_path_shape!(
 
 /// Painter-style authoring wrapper over a [`PaintSink`].
 #[derive(Debug)]
-pub struct Painter<'a, S: PaintSink + ?Sized = dyn PaintSink + 'a> {
+pub struct Painter<
+    'a,
+    S: PaintSink<F, C, B> + ?Sized = dyn PaintSink + 'a,
+    F = Filter,
+    C = Composite,
+    B = Brush,
+> {
     sink: &'a mut S,
+    _marker: PhantomData<(F, C, B)>,
 }
 
-impl<'a, S> Painter<'a, S>
+impl<'a, S, F, C, B> Painter<'a, S, F, C, B>
 where
-    S: PaintSink + ?Sized,
+    S: PaintSink<F, C, B> + ?Sized,
 {
     /// Wrap a paint sink with painter-style authoring helpers.
     #[must_use]
     pub fn new(sink: &'a mut S) -> Self {
-        Self { sink }
+        Self {
+            sink,
+            _marker: PhantomData,
+        }
     }
 
     /// Borrow the wrapped sink directly.
@@ -138,11 +164,11 @@ where
     /// `Painter<'_, dyn PaintSink>` without threading the concrete sink type through the
     /// surrounding API.
     #[must_use]
-    pub fn as_dyn(&mut self) -> Painter<'_, dyn PaintSink + '_>
+    pub fn as_dyn(&mut self) -> Painter<'_, dyn PaintSink<F, C, B> + '_, F, C, B>
     where
         S: Sized,
     {
-        let sink: &mut dyn PaintSink = self.sink_mut();
+        let sink: &mut dyn PaintSink<F, C, B> = self.sink_mut();
         Painter::new(sink)
     }
 
@@ -150,7 +176,10 @@ where
     ///
     /// This forwards to [`record::replay`] without requiring callers to peel the sink back out of
     /// the painter.
-    pub fn replay(&mut self, scene: &record::Scene) {
+    pub fn replay(&mut self, scene: &record::Scene)
+    where
+        S: PaintSink,
+    {
         record::replay(scene, self.sink);
     }
 
@@ -164,11 +193,12 @@ where
     pub fn fill<'b>(
         &'b mut self,
         shape: impl PaintShape<'b>,
-        brush: impl Into<BrushRef<'b>>,
-    ) -> FillBuilder<'b, S> {
+        brush: impl Into<B>,
+    ) -> FillBuilder<'b, S, F, C, B> {
         FillBuilder {
             sink: self.sink,
             draw: FillRef::new(shape.into_geometry_ref(), brush),
+            _marker: PhantomData,
         }
     }
 
@@ -179,8 +209,8 @@ where
     /// - fill rule: [`peniko::Fill::NonZero`]
     /// - brush transform: `None`
     /// - compositing: [`Composite::default()`]
-    pub fn fill_rect<'b>(&mut self, rect: Rect, brush: impl Into<BrushRef<'b>>) {
-        self.sink.fill(FillRef::new(rect, brush));
+    pub fn fill_rect(&mut self, rect: Rect, brush: impl Into<B>) {
+        self.fill(rect, brush).draw();
     }
 
     /// Start configuring a stroke draw.
@@ -193,11 +223,12 @@ where
         &'b mut self,
         shape: impl PaintShape<'b>,
         stroke: &'b Stroke,
-        brush: impl Into<BrushRef<'b>>,
-    ) -> StrokeBuilder<'b, S> {
+        brush: impl Into<B>,
+    ) -> StrokeBuilder<'b, S, F, C, B> {
         StrokeBuilder {
             sink: self.sink,
             draw: StrokeRef::new(shape.into_geometry_ref(), stroke, brush),
+            _marker: PhantomData,
         }
     }
 
@@ -213,8 +244,8 @@ where
     pub fn glyphs<'b>(
         &'b mut self,
         font: &'b peniko::FontData,
-        brush: impl Into<BrushRef<'b>>,
-    ) -> GlyphRunBuilder<'b, S> {
+        brush: impl Into<B>,
+    ) -> GlyphRunBuilder<'b, S, F, C, B> {
         GlyphRunBuilder {
             sink: self.sink,
             font,
@@ -227,6 +258,7 @@ where
             brush: brush.into(),
             brush_transform: None,
             composite: Composite::default(),
+            _marker: PhantomData,
         }
     }
 
@@ -241,7 +273,10 @@ where
     /// - fill rule: [`peniko::Fill::NonZero`]
     /// - brush transform: `None`
     /// - compositing: [`Composite::default()`]
-    pub fn draw_image<'b>(&'b mut self, image: impl Into<ImageBrushRef<'b>>, transform: Affine) {
+    pub fn draw_image<'b>(&'b mut self, image: impl Into<ImageBrushRef<'b>>, transform: Affine)
+    where
+        B: From<ImageBrushRef<'b>>,
+    {
         let image = image.into();
         let rect = Rect::new(
             0.0,
@@ -255,6 +290,38 @@ where
     /// Replay a retained scene picture with the given transform.
     pub fn draw_scene_picture(&mut self, picture: &ScenePicture, transform: Affine) {
         self.sink.scene_picture(picture, transform);
+    }
+
+    /// Borrow an Imaging-only painter from the wrapped sink.
+    ///
+    /// This is for code paths that must use retained Imaging semantics explicitly, such as
+    /// `ScenePicture`, `SceneImage`, SVG rendering, and other renderer-facing display lists.
+    pub fn with_imaging_painter<R>(
+        &mut self,
+        f: impl FnOnce(&mut Painter<'_, record::Scene>) -> R,
+    ) -> R
+    where
+        S: ImagingSceneSink,
+    {
+        let mut painter = self.as_imaging_painter();
+        f(&mut painter)
+    }
+
+    /// Reborrow this painter as an Imaging-scene-backed painter.
+    pub fn as_imaging_painter(&mut self) -> Painter<'_, record::Scene>
+    where
+        S: ImagingSceneSink,
+    {
+        Painter::new(self.sink.imaging_scene_mut())
+    }
+
+    /// Reborrow this painter as an Imaging-only trait-object-backed painter.
+    pub fn as_imaging_dyn(&mut self) -> Painter<'_, dyn PaintSink + '_>
+    where
+        S: ImagingSceneSink,
+    {
+        let sink: &mut dyn PaintSink = self.sink.imaging_scene_mut();
+        Painter::new(sink)
     }
 
     /// Push a context annotation onto the context stack.
@@ -279,7 +346,7 @@ where
         &mut self,
         label: &str,
         source: Option<SourceLocationRef<'_>>,
-        f: impl FnOnce(&mut Painter<'_, S>),
+        f: impl FnOnce(&mut Painter<'_, S, F, C, B>),
     ) {
         self.push_context(label, source);
         f(self);
@@ -353,7 +420,7 @@ where
     }
 
     /// Push a clip, run the provided closure, then pop the clip.
-    pub fn with_clip(&mut self, clip: ClipRef<'_>, f: impl FnOnce(&mut Painter<'_, S>)) {
+    pub fn with_clip(&mut self, clip: ClipRef<'_>, f: impl FnOnce(&mut Painter<'_, S, F, C, B>)) {
         self.push_clip(clip);
         {
             let mut painter = Painter::new(self.sink);
@@ -370,7 +437,7 @@ where
     pub fn with_fill_clip<'b>(
         &'b mut self,
         shape: impl Into<GeometryRef<'b>>,
-        f: impl FnOnce(&mut Painter<'_, S>),
+        f: impl FnOnce(&mut Painter<'_, S, F, C, B>),
     ) {
         self.push_fill_clip(shape);
         {
@@ -388,7 +455,7 @@ where
         &'b mut self,
         shape: impl Into<GeometryRef<'b>>,
         transform: Affine,
-        f: impl FnOnce(&mut Painter<'_, S>),
+        f: impl FnOnce(&mut Painter<'_, S, F, C, B>),
     ) {
         self.push_fill_clip_transformed(shape, transform);
         {
@@ -406,7 +473,7 @@ where
         &'b mut self,
         shape: impl Into<GeometryRef<'b>>,
         stroke: &'b Stroke,
-        f: impl FnOnce(&mut Painter<'_, S>),
+        f: impl FnOnce(&mut Painter<'_, S, F, C, B>),
     ) {
         self.push_stroke_clip(shape, stroke);
         {
@@ -423,7 +490,7 @@ where
         shape: impl Into<GeometryRef<'b>>,
         stroke: &'b Stroke,
         transform: Affine,
-        f: impl FnOnce(&mut Painter<'_, S>),
+        f: impl FnOnce(&mut Painter<'_, S, F, C, B>),
     ) {
         self.push_stroke_clip_transformed(shape, stroke, transform);
         {
@@ -437,7 +504,7 @@ where
     ///
     /// This must be matched by a later [`Self::pop_group`]. Prefer [`Self::with_group`] when the
     /// grouped work fits naturally in a closure.
-    pub fn push_group(&mut self, group: GroupRef<'_>) {
+    pub fn push_group(&mut self, group: GroupRef<'_, F, C>) {
         self.sink.push_group(group);
     }
 
@@ -449,7 +516,11 @@ where
     }
 
     /// Push an isolated group, run the provided closure, then pop the group.
-    pub fn with_group(&mut self, group: GroupRef<'_>, f: impl FnOnce(&mut Painter<'_, S>)) {
+    pub fn with_group(
+        &mut self,
+        group: GroupRef<'_, F, C>,
+        f: impl FnOnce(&mut Painter<'_, S, F, C, B>),
+    ) {
         self.push_group(group);
         {
             let mut painter = Painter::new(self.sink);
@@ -485,10 +556,20 @@ where
         &mut self,
         mode: MaskMode,
         mask: impl FnOnce(&mut Painter<'_, record::Scene>),
-        content: impl FnOnce(&mut Painter<'_, S>),
-    ) {
+        content: impl FnOnce(&mut Painter<'_, S, F, C, B>),
+    ) where
+        C: Default,
+    {
         let mask = Self::record_mask(mode, mask);
-        self.with_group(GroupRef::new().with_mask(mask.as_ref()), content);
+        self.with_group(
+            GroupRef {
+                clip: None,
+                mask: Some(crate::AppliedMaskRef::new(mask.as_ref())),
+                filters: &[],
+                composite: C::default(),
+            },
+            content,
+        );
     }
 }
 
@@ -515,7 +596,7 @@ mod tests {
 
         fn pop_clip(&mut self) {}
 
-        fn push_group(&mut self, _group: GroupRef<'_>) {}
+        fn push_group(&mut self, _group: GroupRef<'_, F, C>) {}
 
         fn pop_group(&mut self) {}
 
@@ -819,14 +900,15 @@ mod tests {
 /// Builder for configuring a fill draw before emission.
 #[derive(Debug)]
 #[must_use = "fill builders do nothing until you call .draw()"]
-pub struct FillBuilder<'a, S: ?Sized> {
+pub struct FillBuilder<'a, S: ?Sized, F = Filter, C = Composite, B = Brush> {
     sink: &'a mut S,
-    draw: FillRef<'a>,
+    draw: FillRef<'a, B>,
+    _marker: PhantomData<(F, C)>,
 }
 
-impl<'a, S> FillBuilder<'a, S>
+impl<'a, S, F, C, B> FillBuilder<'a, S, F, C, B>
 where
-    S: PaintSink + ?Sized,
+    S: PaintSink<F, C, B> + ?Sized,
 {
     /// Set the geometry transform.
     pub fn transform(mut self, transform: Affine) -> Self {
@@ -861,14 +943,15 @@ where
 /// Builder for configuring a stroke draw before emission.
 #[derive(Debug)]
 #[must_use = "stroke builders do nothing until you call .draw()"]
-pub struct StrokeBuilder<'a, S: ?Sized> {
+pub struct StrokeBuilder<'a, S: ?Sized, F = Filter, C = Composite, B = Brush> {
     sink: &'a mut S,
-    draw: StrokeRef<'a>,
+    draw: StrokeRef<'a, B>,
+    _marker: PhantomData<(F, C, B)>,
 }
 
-impl<'a, S> StrokeBuilder<'a, S>
+impl<'a, S, F, C, B> StrokeBuilder<'a, S, F, C, B>
 where
-    S: PaintSink + ?Sized,
+    S: PaintSink<F, C, B> + ?Sized,
 {
     /// Set the geometry transform.
     pub fn transform(mut self, transform: Affine) -> Self {
@@ -897,7 +980,7 @@ where
 /// Builder for configuring a glyph run before emission.
 #[derive(Debug)]
 #[must_use = "glyph builders do nothing until you call .draw(...)"]
-pub struct GlyphRunBuilder<'a, S: ?Sized> {
+pub struct GlyphRunBuilder<'a, S: ?Sized, F = Filter, C = Composite, B = Brush> {
     sink: &'a mut S,
     font: &'a peniko::FontData,
     transform: Affine,
@@ -906,14 +989,15 @@ pub struct GlyphRunBuilder<'a, S: ?Sized> {
     font_embolden: Vec2,
     hint: bool,
     normalized_coords: &'a [NormalizedCoord],
-    brush: BrushRef<'a>,
+    brush: B,
     brush_transform: Option<Affine>,
     composite: Composite,
+    _marker: PhantomData<(F, C, B)>,
 }
 
-impl<'a, S> GlyphRunBuilder<'a, S>
+impl<'a, S, F, C, B> GlyphRunBuilder<'a, S, F, C, B>
 where
-    S: PaintSink + ?Sized,
+    S: PaintSink<F, C, B> + ?Sized,
 {
     /// Set the global run transform.
     pub fn transform(mut self, transform: Affine) -> Self {

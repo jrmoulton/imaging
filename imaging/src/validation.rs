@@ -71,8 +71,8 @@
 //! ```
 
 use crate::{
-    AppliedMaskRef, BlurredRoundedRect, BrushRef, ClipRef, Composite, FillRef, Filter, GlyphRunRef,
-    GroupRef, ImageRef, PaintSink, StrokeRef,
+    AppliedMaskRef, BlurredRoundedRect, Brush, ClipRef, Composite, FillRef, Filter, GlyphRunRef,
+    GroupRef, Image, PaintSink, StrokeRef,
     record::{self, Geometry, Glyph},
 };
 use kurbo::{Affine, BezPath, Rect, RoundedRect, Stroke};
@@ -371,11 +371,11 @@ where
         }
     }
 
-    fn validate_brush(&mut self, brush: BrushRef<'_>) -> bool {
+    fn validate_owned_brush(&mut self, brush: &Brush) -> bool {
         match brush {
-            BrushRef::Solid(_) => true,
-            BrushRef::Gradient(gradient) => self.validate_gradient(gradient),
-            BrushRef::Image(image_brush) => self.validate_image_brush(image_brush),
+            Brush::Solid(_) => true,
+            Brush::Gradient(gradient) => self.validate_gradient(gradient),
+            Brush::Image(image_brush) => self.validate_owned_image_brush(image_brush),
         }
     }
 
@@ -446,41 +446,44 @@ where
         }
     }
 
-    fn validate_image_brush(&mut self, image_brush: crate::ImageBrushRef<'_>) -> bool {
+    fn validate_owned_image_brush(&mut self, image_brush: &crate::ImageBrush) -> bool {
         if !(image_brush.sampler.alpha.is_finite() && image_brush.sampler.alpha >= 0.0) {
             return !self.violate(ValidationError::InvalidBrush {
                 what: "Brush::Image::alpha",
             });
         }
 
-        match image_brush.image {
-            ImageRef::Raster(image) => {
-                if image
-                    .format
-                    .size_in_bytes(image.width, image.height)
-                    .is_none_or(|expected| expected != image.data.len())
-                {
-                    return !self.violate(ValidationError::InvalidBrush {
-                        what: "Brush::Image::data_len",
-                    });
-                }
-            }
-            ImageRef::Scene(scene) => {
+        match &image_brush.image {
+            Image::Raster(image) => self.validate_raster_image_data(image),
+            Image::Scene(scene) => {
                 if scene.scene().validate().is_err() {
                     return !self.violate(ValidationError::InvalidBrush {
                         what: "Brush::Image::scene",
                     });
                 }
+                true
             }
-            ImageRef::External(image) => {
+            Image::External(image) => {
                 if image.width == 0 || image.height == 0 {
                     return !self.violate(ValidationError::InvalidBrush {
                         what: "Brush::Image::external_size",
                     });
                 }
+                true
             }
         }
+    }
 
+    fn validate_raster_image_data(&mut self, image: &peniko::ImageData) -> bool {
+        if image
+            .format
+            .size_in_bytes(image.width, image.height)
+            .is_none_or(|expected| expected != image.data.len())
+        {
+            return !self.violate(ValidationError::InvalidBrush {
+                what: "Brush::Image::data_len",
+            });
+        }
         true
     }
 
@@ -498,7 +501,7 @@ where
             })
             && font_size_ok
             && glyphs_ok
-            && self.validate_brush(glyph_run.brush)
+            && self.validate_owned_brush(&glyph_run.brush)
             && match glyph_run.style {
                 peniko::Style::Fill(_) => true,
                 peniko::Style::Stroke(stroke) => self.validate_stroke(stroke),
@@ -650,7 +653,7 @@ where
         }
 
         let ok = self.validate_affine("Draw::Fill::transform", &draw.transform)
-            && self.validate_brush(draw.brush)
+            && self.validate_owned_brush(&draw.brush)
             && draw
                 .brush_transform
                 .as_ref()
@@ -670,7 +673,7 @@ where
         }
 
         let ok = self.validate_affine("Draw::Stroke::transform", &draw.transform)
-            && self.validate_brush(draw.brush)
+            && self.validate_owned_brush(&draw.brush)
             && draw
                 .brush_transform
                 .as_ref()

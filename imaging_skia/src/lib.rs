@@ -198,7 +198,8 @@ use crate::gpu_readback::{
 };
 #[cfg(feature = "gpu")]
 use imaging_wgpu::{
-    ExternalImageResolver, TextureRenderer, TextureRendererError, TextureTargetError,
+    ExternalImageResolver, TextureRenderSubmission, TextureRenderer, TextureRendererError,
+    TextureTargetError,
 };
 use sinks::MaskCache;
 pub use sinks::{SkCanvasSink, SkPictureRecorderSink};
@@ -924,6 +925,8 @@ impl SkiaGpuRendererState {
         surface.canvas().clear(sk::Color::TRANSPARENT);
         surface.canvas().draw_picture(picture, None, None);
         self.backend.flush_surface(&mut surface);
+        drop(surface);
+        self.backend.purge_unlocked_resources();
         Ok(())
     }
 
@@ -931,7 +934,7 @@ impl SkiaGpuRendererState {
         &mut self,
         source: &mut dyn RenderSource,
         texture: &wgpu::Texture,
-    ) -> Result<(), Error> {
+    ) -> Result<TextureRenderSubmission, Error> {
         let _ = Self::checked_texture_size(texture)?;
         source.validate().map_err(Error::InvalidScene)?;
         let mut surface = self.backend.wrap_texture(texture)?;
@@ -947,7 +950,11 @@ impl SkiaGpuRendererState {
         source.paint_into(&mut sink);
         sink.finish()?;
         self.backend.flush_surface(&mut surface);
-        Ok(())
+        drop(surface);
+        self.backend.purge_unlocked_resources();
+        Ok(TextureRenderSubmission::wgpu(
+            self.queue.submit(std::iter::empty::<wgpu::CommandBuffer>()),
+        ))
     }
 
     fn render_source_into_texture_with_external_images(
@@ -955,7 +962,7 @@ impl SkiaGpuRendererState {
         source: &mut dyn RenderSource,
         texture: &wgpu::Texture,
         resolver: &mut dyn ExternalImageResolver,
-    ) -> Result<(), Error> {
+    ) -> Result<TextureRenderSubmission, Error> {
         let _ = Self::checked_texture_size(texture)?;
         source.validate().map_err(Error::InvalidScene)?;
         let mut surface = self.backend.wrap_texture(texture)?;
@@ -974,7 +981,11 @@ impl SkiaGpuRendererState {
             sink.finish()?;
         }
         self.backend.flush_surface(&mut surface);
-        Ok(())
+        drop(surface);
+        self.backend.purge_unlocked_resources();
+        Ok(TextureRenderSubmission::wgpu(
+            self.queue.submit(std::iter::empty::<wgpu::CommandBuffer>()),
+        ))
     }
 
     fn render_picture_to_texture_for_readback(
@@ -1075,7 +1086,7 @@ impl SkiaRenderer {
         source: &mut dyn RenderSource,
         texture: &wgpu::Texture,
         resolver: &mut dyn ExternalImageResolver,
-    ) -> Result<(), Error> {
+    ) -> Result<TextureRenderSubmission, Error> {
         self.state
             .render_source_into_texture_with_external_images(source, texture, resolver)
     }
@@ -1111,7 +1122,7 @@ impl TextureRenderer for SkiaRenderer {
         &mut self,
         source: &mut dyn RenderSource,
         target: Self::TextureTarget,
-    ) -> Result<(), TextureRendererError> {
+    ) -> Result<TextureRenderSubmission, TextureRendererError> {
         self.state
             .render_source_into_texture(source, &target)
             .map_err(map_texture_renderer_error)
@@ -1122,7 +1133,7 @@ impl TextureRenderer for SkiaRenderer {
         source: &mut dyn RenderSource,
         target: Self::TextureTarget,
         resolver: &mut dyn ExternalImageResolver,
-    ) -> Result<(), TextureRendererError> {
+    ) -> Result<TextureRenderSubmission, TextureRendererError> {
         self.state
             .render_source_into_texture_with_external_images(source, &target, resolver)
             .map_err(map_texture_renderer_error)
@@ -1144,7 +1155,8 @@ impl TextureRenderer for SkiaRenderer {
         )
         .texture()
         .clone();
-        self.state
+        let _ = self
+            .state
             .render_source_into_texture(source, &texture)
             .map_err(map_texture_renderer_error)?;
         Ok(texture)
@@ -2026,7 +2038,7 @@ fn brush_to_paint(
                         image,
                         tile_modes,
                         sampling_options_from_quality(image_brush.sampler.quality),
-                        &affine_to_matrix(paint_xf),
+                        paint_xf,
                     )
                 }
                 #[cfg(not(feature = "gpu"))]

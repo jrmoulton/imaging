@@ -12,8 +12,8 @@ use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke, Vec2};
 use peniko::{Fill, FontData, Style};
 
 use crate::{
-    BlurredRoundedRect, Brush, ClipRef, Composite, ContextRef, FillRef, GlyphRunRef, GroupRef,
-    MaskMode, NormalizedCoord, PaintSink, ScenePicture, SourceLocationRef, StrokeRef,
+    BlurredRoundedRect, Brush, ClipRef, Composite, ContextRef, FillRef, Filter, GlyphRunRef,
+    GroupRef, MaskMode, NormalizedCoord, PaintSink, ScenePicture, SourceLocationRef, StrokeRef,
 };
 
 /// A geometry payload stored in a recording.
@@ -203,18 +203,18 @@ impl AppliedMask {
 /// [`Group::composite`]. If `clip` is present, it is applied to the group's result at
 /// composite time (isolated clip).
 #[derive(Clone, Debug, PartialEq)]
-pub struct Group {
+pub struct Group<F = Filter, C = Composite> {
     /// Optional isolated clip applied to the group result.
     pub clip: Option<Clip>,
     /// Optional retained mask applied to the group result before compositing.
     pub mask: Option<AppliedMask>,
     /// Optional filter chain applied to the group result before compositing.
-    pub filters: Vec<crate::Filter>,
+    pub filters: Vec<F>,
     /// Compositing parameters used when merging the group into its parent.
-    pub composite: Composite,
+    pub composite: C,
 }
 
-impl Default for Group {
+impl Default for Group<Filter, Composite> {
     #[inline]
     fn default() -> Self {
         Self {

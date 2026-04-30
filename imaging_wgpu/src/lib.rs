@@ -179,7 +179,7 @@ pub trait TextureRenderer: ImageRenderer {
         &mut self,
         source: &mut dyn RenderSource,
         target: Self::TextureTarget,
-    ) -> Result<(), TextureRendererError>;
+    ) -> Result<TextureRenderSubmission, TextureRendererError>;
 
     /// Render a source that may contain external image brushes into a caller-provided texture
     /// target.
@@ -191,7 +191,7 @@ pub trait TextureRenderer: ImageRenderer {
         _source: &mut dyn RenderSource,
         _target: Self::TextureTarget,
         _resolver: &mut dyn ExternalImageResolver,
-    ) -> Result<(), TextureRendererError> {
+    ) -> Result<TextureRenderSubmission, TextureRendererError> {
         Err(TextureRendererError::Target(
             TextureTargetError::InvalidTarget("renderer does not support external images"),
         ))
@@ -204,4 +204,29 @@ pub trait TextureRenderer: ImageRenderer {
         width: u32,
         height: u32,
     ) -> Result<Self::Texture, TextureRendererError>;
+}
+
+/// GPU submission produced by rendering into a caller-owned texture target.
+#[derive(Clone, Debug, Default)]
+pub struct TextureRenderSubmission {
+    /// The wgpu submission that makes the rendered texture ready, when the backend can expose one.
+    pub submission_index: Option<wgpu::SubmissionIndex>,
+}
+
+impl TextureRenderSubmission {
+    /// Create a submission record for a renderer that did not expose a wgpu submission.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            submission_index: None,
+        }
+    }
+
+    /// Create a submission record for a renderer whose output is ready after `submission_index`.
+    #[must_use]
+    pub fn wgpu(submission_index: wgpu::SubmissionIndex) -> Self {
+        Self {
+            submission_index: Some(submission_index),
+        }
+    }
 }

@@ -167,7 +167,9 @@ pub use paint::{
     AppliedMaskRef, ClipRef, ContextRef, DrawRef, FillRef, GeometryRef, GlyphRunRef, GroupRef,
     MaskRef, PaintSink, SourceLocationRef, StrokeRef,
 };
-pub use painter::{FillBuilder, GlyphRunBuilder, PaintShape, Painter, StrokeBuilder};
+pub use painter::{
+    FillBuilder, GlyphRunBuilder, ImagingSceneSink, PaintShape, Painter, StrokeBuilder,
+};
 pub use render::{
     ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError, RenderSource,
 };

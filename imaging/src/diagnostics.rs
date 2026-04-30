@@ -13,7 +13,7 @@
 use alloc::vec::Vec;
 
 use crate::{
-    BlurredRoundedRect, BrushRef, ClipRef, Composite, ContextRef, FillRef, GlyphRunRef, GroupRef,
+    BlurredRoundedRect, Brush, ClipRef, Composite, ContextRef, FillRef, GlyphRunRef, GroupRef,
     PaintSink, SourceLocationRef, StrokeRef,
     record::{ContextNote, ResolvedSourceLocation, Scene},
 };
@@ -400,21 +400,21 @@ fn geometry_ref_is_empty_path(geometry: &crate::GeometryRef<'_>) -> bool {
 }
 
 fn draw_is_fully_transparent_fill(draw: &FillRef<'_>) -> bool {
-    draw.composite.alpha <= 0.0 || brush_ref_is_fully_transparent(draw.brush)
+    draw.composite.alpha <= 0.0 || brush_is_fully_transparent(&draw.brush)
 }
 
 fn draw_is_fully_transparent_stroke(draw: &StrokeRef<'_>) -> bool {
-    draw.composite.alpha <= 0.0 || brush_ref_is_fully_transparent(draw.brush)
+    draw.composite.alpha <= 0.0 || brush_is_fully_transparent(&draw.brush)
 }
 
 fn draw_is_fully_transparent_glyph_run(draw: &GlyphRunRef<'_>) -> bool {
-    draw.composite.alpha <= 0.0 || brush_ref_is_fully_transparent(draw.brush)
+    draw.composite.alpha <= 0.0 || brush_is_fully_transparent(&draw.brush)
 }
 
-fn brush_ref_is_fully_transparent(brush: BrushRef<'_>) -> bool {
+fn brush_is_fully_transparent(brush: &Brush) -> bool {
     match brush {
-        BrushRef::Solid(color) => color.components[3] <= 0.0,
-        BrushRef::Gradient(_) | BrushRef::Image(_) => false,
+        Brush::Solid(color) => color.components[3] <= 0.0,
+        Brush::Gradient(_) | Brush::Image(_) => false,
     }
 }
 

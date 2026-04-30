@@ -172,7 +172,10 @@ use imaging::render::{
     ImageTargetError, RenderContentError, RenderSource,
 };
 pub use imaging_wgpu::wgpu;
-use imaging_wgpu::{TextureRenderer, TextureRendererError, TextureTargetError, TextureViewTarget};
+use imaging_wgpu::{
+    TextureRenderSubmission, TextureRenderer, TextureRendererError, TextureTargetError,
+    TextureViewTarget,
+};
 use vello_hybrid::{RenderError, RenderSize, RenderTargetConfig};
 use wgpu::{CommandEncoderDescriptor, TextureFormat};
 
@@ -273,7 +276,7 @@ impl VelloHybridRendererState {
         texture_view: &wgpu::TextureView,
         width: u32,
         height: u32,
-    ) -> Result<(), Error> {
+    ) -> Result<TextureRenderSubmission, Error> {
         let render_size = RenderSize { width, height };
         let mut encoder = self
             .device
@@ -293,8 +296,9 @@ impl VelloHybridRendererState {
             )
             .map_err(Error::Render)?;
 
-        self.queue.submit([encoder.finish()]);
-        Ok(())
+        Ok(TextureRenderSubmission::wgpu(
+            self.queue.submit([encoder.finish()]),
+        ))
     }
 }
 
@@ -364,7 +368,7 @@ impl VelloHybridRenderer {
         texture_view: &wgpu::TextureView,
         width: u32,
         height: u32,
-    ) -> Result<(), Error> {
+    ) -> Result<TextureRenderSubmission, Error> {
         self.state
             .render_to_view(scene, texture_view, width, height)
     }
@@ -398,7 +402,7 @@ impl TextureRenderer for VelloHybridRenderer {
         &mut self,
         source: &mut dyn RenderSource,
         target: TextureViewTarget,
-    ) -> Result<(), TextureRendererError> {
+    ) -> Result<TextureRenderSubmission, TextureRendererError> {
         let native = self
             .encode_source(source, target.width, target.height)
             .map_err(map_texture_renderer_error)?;
@@ -423,13 +427,14 @@ impl TextureRenderer for VelloHybridRenderer {
             u32::from(target_height),
         );
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.render_to_texture_view(
-            &native,
-            &texture_view,
-            u32::from(target_width),
-            u32::from(target_height),
-        )
-        .map_err(map_texture_renderer_error)?;
+        let _ = self
+            .render_to_texture_view(
+                &native,
+                &texture_view,
+                u32::from(target_width),
+                u32::from(target_height),
+            )
+            .map_err(map_texture_renderer_error)?;
         Ok(texture)
     }
 }

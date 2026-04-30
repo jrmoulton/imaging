@@ -451,6 +451,12 @@ impl From<peniko::ImageBrush> for ImageBrush {
     }
 }
 
+impl From<ImageBrushRef<'_>> for ImageBrush {
+    fn from(image: ImageBrushRef<'_>) -> Self {
+        image_brush_ref_to_owned(&image)
+    }
+}
+
 /// Borrowed image brush.
 pub type ImageBrushRef<'a> = ImageBrush<ImageRef<'a>>;
 
@@ -509,13 +515,13 @@ impl From<ExternalImage> for ImageBrushRef<'_> {
 
 /// Imaging-owned brush.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Brush {
+pub enum Brush<I = ImageBrush, G = peniko::Gradient> {
     /// Solid color brush.
     Solid(peniko::Color),
     /// Gradient brush.
-    Gradient(peniko::Gradient),
+    Gradient(G),
     /// Image brush.
-    Image(ImageBrush),
+    Image(I),
 }
 
 impl Brush {
@@ -549,33 +555,62 @@ impl Brush {
     }
 }
 
-impl Default for Brush {
+impl<I, G> Default for Brush<I, G> {
     fn default() -> Self {
         Self::Solid(peniko::Color::TRANSPARENT)
     }
 }
 
-impl From<peniko::Color> for Brush {
+impl<I, G> From<peniko::Color> for Brush<I, G> {
     fn from(value: peniko::Color) -> Self {
         Self::Solid(value)
     }
 }
 
-impl From<&peniko::Color> for Brush {
+impl<I, G> From<&peniko::Color> for Brush<I, G> {
     fn from(value: &peniko::Color) -> Self {
         Self::Solid(*value)
     }
 }
 
-impl From<peniko::Gradient> for Brush {
+impl<I, G> From<&Brush<I, G>> for Brush<I, G>
+where
+    I: Clone,
+    G: Clone,
+{
+    fn from(value: &Brush<I, G>) -> Self {
+        value.clone()
+    }
+}
+
+impl<I> From<peniko::Gradient> for Brush<I, peniko::Gradient> {
     fn from(value: peniko::Gradient) -> Self {
         Self::Gradient(value)
     }
 }
 
-impl From<ImageBrush> for Brush {
-    fn from(value: ImageBrush) -> Self {
+impl<D, G> From<ImageBrush<D>> for Brush<ImageBrush<D>, G> {
+    fn from(value: ImageBrush<D>) -> Self {
         Self::Image(value)
+    }
+}
+
+impl<'a, I> From<BrushRef<'a>> for Brush<I>
+where
+    I: From<ImageBrushRef<'a>>,
+{
+    fn from(value: BrushRef<'a>) -> Self {
+        match value {
+            Brush::Solid(color) => Self::Solid(color),
+            Brush::Gradient(gradient) => Self::Gradient(gradient.clone()),
+            Brush::Image(image) => Self::Image(image.into()),
+        }
+    }
+}
+
+impl From<ImageBrushRef<'_>> for Brush {
+    fn from(value: ImageBrushRef<'_>) -> Self {
+        Self::Image(value.into())
     }
 }
 
@@ -590,15 +625,7 @@ impl From<peniko::Brush> for Brush {
 }
 
 /// Borrowed imaging brush.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum BrushRef<'a> {
-    /// Solid color brush.
-    Solid(peniko::Color),
-    /// Gradient brush.
-    Gradient(&'a peniko::Gradient),
-    /// Image brush.
-    Image(ImageBrushRef<'a>),
-}
+pub type BrushRef<'a> = Brush<ImageBrushRef<'a>, &'a peniko::Gradient>;
 
 impl BrushRef<'_> {
     /// Convert the borrowed brush into an owned brush.
@@ -612,19 +639,7 @@ impl BrushRef<'_> {
     }
 }
 
-impl<'a> From<peniko::Color> for BrushRef<'a> {
-    fn from(value: peniko::Color) -> Self {
-        Self::Solid(value)
-    }
-}
-
-impl<'a> From<&'a peniko::Color> for BrushRef<'a> {
-    fn from(value: &'a peniko::Color) -> Self {
-        Self::Solid(*value)
-    }
-}
-
-impl<'a> From<&'a peniko::Gradient> for BrushRef<'a> {
+impl<'a, I> From<&'a peniko::Gradient> for Brush<I, &'a peniko::Gradient> {
     fn from(value: &'a peniko::Gradient) -> Self {
         Self::Gradient(value)
     }
@@ -633,12 +648,6 @@ impl<'a> From<&'a peniko::Gradient> for BrushRef<'a> {
 impl<'a> From<&'a ImageBrush> for BrushRef<'a> {
     fn from(value: &'a ImageBrush) -> Self {
         Self::Image(image_brush_as_ref(value))
-    }
-}
-
-impl<'a> From<ImageBrushRef<'a>> for BrushRef<'a> {
-    fn from(value: ImageBrushRef<'a>) -> Self {
-        Self::Image(value)
     }
 }
 
@@ -667,6 +676,15 @@ impl<'a> From<&'a Brush> for BrushRef<'a> {
             Brush::Gradient(gradient) => Self::Gradient(gradient),
             Brush::Image(image) => Self::Image(image_brush_as_ref(image)),
         }
+    }
+}
+
+impl<'a, I> From<&'a peniko::Brush> for Brush<I>
+where
+    I: From<ImageBrushRef<'a>>,
+{
+    fn from(value: &'a peniko::Brush) -> Self {
+        BrushRef::from(value).into()
     }
 }
 

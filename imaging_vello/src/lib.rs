@@ -129,7 +129,10 @@ use imaging::render::{
     GpuReadbackError, ImageBufferFormat, ImageBufferTarget, ImageRenderer, ImageRendererError,
     ImageTargetError, RenderContentError, RenderSource,
 };
-use imaging_wgpu::{TextureRenderer, TextureRendererError, TextureTargetError, TextureViewTarget};
+use imaging_wgpu::{
+    TextureRenderSubmission, TextureRenderer, TextureRendererError, TextureTargetError,
+    TextureViewTarget,
+};
 use kurbo::Rect;
 
 #[cfg(feature = "vello-0-7")]
@@ -240,7 +243,7 @@ impl VelloRendererState {
         texture_view: &wgpu::TextureView,
         width: u32,
         height: u32,
-    ) -> Result<(), Error> {
+    ) -> Result<TextureRenderSubmission, Error> {
         let params = RenderParams {
             base_color: peniko::Color::from_rgba8(0, 0, 0, 0),
             width,
@@ -250,7 +253,10 @@ impl VelloRendererState {
 
         self.renderer
             .render_to_texture(&self.device, &self.queue, scene, texture_view, &params)
-            .map_err(Error::Render)
+            .map_err(Error::Render)?;
+        Ok(TextureRenderSubmission::wgpu(
+            self.queue.submit(std::iter::empty::<wgpu::CommandBuffer>()),
+        ))
     }
 }
 
@@ -289,7 +295,7 @@ impl VelloRenderer {
         texture_view: &wgpu::TextureView,
         width: u32,
         height: u32,
-    ) -> Result<(), Error> {
+    ) -> Result<TextureRenderSubmission, Error> {
         self.state
             .render_to_view(scene, texture_view, width, height)
     }
@@ -323,7 +329,7 @@ impl TextureRenderer for VelloRenderer {
         &mut self,
         source: &mut dyn RenderSource,
         target: TextureViewTarget,
-    ) -> Result<(), TextureRendererError> {
+    ) -> Result<TextureRenderSubmission, TextureRendererError> {
         let native = self
             .encode_source(source, target.width, target.height)
             .map_err(map_texture_renderer_error)?;
@@ -348,13 +354,14 @@ impl TextureRenderer for VelloRenderer {
             u32::from(target_height),
         );
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.render_to_texture_view(
-            &native,
-            &texture_view,
-            u32::from(target_width),
-            u32::from(target_height),
-        )
-        .map_err(map_texture_renderer_error)?;
+        let _ = self
+            .render_to_texture_view(
+                &native,
+                &texture_view,
+                u32::from(target_width),
+                u32::from(target_height),
+            )
+            .map_err(map_texture_renderer_error)?;
         Ok(texture)
     }
 }

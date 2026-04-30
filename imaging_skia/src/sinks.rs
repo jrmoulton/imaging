@@ -320,7 +320,7 @@ fn draw_glyph_run(
     set_matrix(canvas, glyph_run.transform);
 
     let Some(mut sk_paint) = brush_to_paint(
-        glyph_run.brush,
+        (&glyph_run.brush).into(),
         glyph_run.composite.alpha,
         glyph_run.brush_transform.unwrap_or(Affine::IDENTITY),
         image_cache,
@@ -723,7 +723,7 @@ fn paint_sink_fill(
 
     set_matrix(canvas, draw.transform);
     let Some(mut sk_paint) = brush_to_paint(
-        draw.brush,
+        (&draw.brush).into(),
         draw.composite.alpha,
         draw.brush_transform.unwrap_or(Affine::IDENTITY),
         image_cache,
@@ -784,7 +784,7 @@ fn paint_sink_stroke(
 
     set_matrix(canvas, draw.transform);
     let Some(mut sk_paint) = brush_to_paint(
-        draw.brush,
+        (&draw.brush).into(),
         draw.composite.alpha,
         draw.brush_transform.unwrap_or(Affine::IDENTITY),
         image_cache,
@@ -851,7 +851,7 @@ impl ExternalImageRenderContext<'_> {
         image: imaging::ExternalImage,
         tile_modes: Option<(sk::TileMode, sk::TileMode)>,
         sampling: sk::SamplingOptions,
-        local_matrix: &sk::Matrix,
+        local_xf: Affine,
     ) -> Option<sk::Shader> {
         let resolved = self.resolver.resolve_external_image(image)?;
         let sk_image = self
@@ -861,7 +861,17 @@ impl ExternalImageRenderContext<'_> {
                 alpha_type_for_image_alpha_type(image.alpha_type),
             )
             .ok()?;
-        let shader = sk_image.to_shader(tile_modes, sampling, Some(local_matrix));
+        let local_xf = if image.width == 0 || image.height == 0 {
+            local_xf
+        } else {
+            local_xf
+                * Affine::scale_non_uniform(
+                    f64::from(image.width) / f64::from(resolved.width),
+                    f64::from(image.height) / f64::from(resolved.height),
+                )
+        };
+        let local_matrix = affine_to_matrix(local_xf);
+        let shader = sk_image.to_shader(tile_modes, sampling, Some(&local_matrix));
         self.retained.push(resolved);
         self.retained_images.push(sk_image);
         shader

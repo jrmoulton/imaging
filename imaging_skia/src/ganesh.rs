@@ -162,4 +162,9 @@ impl GaneshBackend {
         self.direct_context()
             .flush_and_submit_surface(surface, sk::gpu::SyncCpu::Yes);
     }
+
+    pub(crate) fn purge_unlocked_resources(&mut self) {
+        self.direct_context()
+            .purge_unlocked_resources(sk::gpu::PurgeResourceOptions::AllResources);
+    }
 }

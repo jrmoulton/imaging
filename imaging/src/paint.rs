@@ -11,7 +11,7 @@ use kurbo::{Affine, BezPath, Rect, RoundedRect, Shape as _, Stroke, Vec2};
 use peniko::{Fill, Style};
 
 use crate::{
-    BlurredRoundedRect, BrushRef, Composite, Filter, MaskMode, NormalizedCoord, ScenePicture,
+    BlurredRoundedRect, Composite, Filter, MaskMode, NormalizedCoord, ScenePicture,
     record::{
         AppliedMask, Clip, ClipId, Command, Draw, DrawId, Geometry, Glyph, GlyphRun, Group,
         GroupId, Mask, MaskId, Scene,
@@ -229,19 +229,23 @@ impl<'a> ClipRef<'a> {
 }
 
 /// Borrowed isolated group payload.
+///
+/// `F` is the filter/effect payload type and `C` is the compositing payload type. The defaults are
+/// Imaging's standard [`Filter`] and [`Composite`] so renderer-facing APIs remain unchanged, while
+/// higher-level toolkits can use custom payloads during their own recording/lowering phase.
 #[derive(Clone, Debug, PartialEq)]
-pub struct GroupRef<'a> {
+pub struct GroupRef<'a, F = Filter, C = Composite> {
     /// Optional isolated clip applied to the group result.
     pub clip: Option<ClipRef<'a>>,
     /// Optional retained mask applied to the group result before compositing.
     pub mask: Option<AppliedMaskRef<'a>>,
     /// Optional filter chain applied to the group result before compositing.
-    pub filters: &'a [Filter],
+    pub filters: &'a [F],
     /// Compositing parameters used when merging the group into its parent.
-    pub composite: Composite,
+    pub composite: C,
 }
 
-impl<'a> GroupRef<'a> {
+impl<'a> GroupRef<'a, Filter, Composite> {
     /// Create a group with default compositing and no isolated clip or filters.
     #[must_use]
     pub fn new() -> Self {
@@ -252,7 +256,9 @@ impl<'a> GroupRef<'a> {
             composite: Composite::default(),
         }
     }
+}
 
+impl<'a, F, C> GroupRef<'a, F, C> {
     /// Set the isolated clip applied to the group result.
     #[must_use]
     pub fn with_clip(mut self, clip: ClipRef<'a>) -> Self {
@@ -280,18 +286,20 @@ impl<'a> GroupRef<'a> {
 
     /// Set the filter chain applied to the group result.
     #[must_use]
-    pub fn with_filters(mut self, filters: &'a [Filter]) -> Self {
+    pub fn with_filters(mut self, filters: &'a [F]) -> Self {
         self.filters = filters;
         self
     }
 
     /// Set the compositing parameters used when merging the group into its parent.
     #[must_use]
-    pub fn with_composite(mut self, composite: Composite) -> Self {
+    pub fn with_composite(mut self, composite: C) -> Self {
         self.composite = composite;
         self
     }
+}
 
+impl<'a> GroupRef<'a, Filter, Composite> {
     pub(crate) fn into_owned_with(
         self,
         define_mask: &mut impl FnMut(MaskRef<'_>) -> MaskId,
@@ -314,7 +322,7 @@ impl<'a> GroupRef<'a> {
     }
 }
 
-impl<'a> Default for GroupRef<'a> {
+impl<'a> Default for GroupRef<'a, Filter, Composite> {
     fn default() -> Self {
         Self::new()
     }
@@ -393,13 +401,13 @@ impl<'a> AppliedMaskRef<'a> {
 
 /// Borrowed fill draw payload.
 #[derive(Clone, Debug, PartialEq)]
-pub struct FillRef<'a> {
+pub struct FillRef<'a, B = crate::Brush> {
     /// Geometry transform.
     pub transform: Affine,
     /// Fill rule used to determine inside/outside for paths.
     pub fill_rule: Fill,
     /// Brush used by this draw.
-    pub brush: BrushRef<'a>,
+    pub brush: B,
     /// Optional brush-space transform (for gradients/images).
     pub brush_transform: Option<Affine>,
     /// Geometry to fill.
@@ -408,7 +416,7 @@ pub struct FillRef<'a> {
     pub composite: Composite,
 }
 
-impl<'a> FillRef<'a> {
+impl<'a, B> FillRef<'a, B> {
     /// Create a fill draw with default state.
     ///
     /// Defaults:
@@ -417,7 +425,7 @@ impl<'a> FillRef<'a> {
     /// - brush transform: `None`
     /// - compositing: [`Composite::default()`]
     #[must_use]
-    pub fn new(shape: impl Into<GeometryRef<'a>>, brush: impl Into<BrushRef<'a>>) -> Self {
+    pub fn new(shape: impl Into<GeometryRef<'a>>, brush: impl Into<B>) -> Self {
         Self {
             transform: Affine::IDENTITY,
             fill_rule: Fill::NonZero,
@@ -456,19 +464,6 @@ impl<'a> FillRef<'a> {
         self
     }
 
-    /// Convert a borrowed fill payload into an owned [`Draw`].
-    #[must_use]
-    pub fn to_owned(self) -> Draw {
-        Draw::Fill {
-            transform: self.transform,
-            fill_rule: self.fill_rule,
-            brush: self.brush.to_owned(),
-            brush_transform: self.brush_transform,
-            shape: self.shape.to_owned(),
-            composite: self.composite,
-        }
-    }
-
     #[must_use]
     pub(crate) fn prepend_transform(self, prefix: Affine) -> Self {
         Self {
@@ -478,15 +473,33 @@ impl<'a> FillRef<'a> {
     }
 }
 
+impl<'a, B> FillRef<'a, B>
+where
+    crate::Brush: From<B>,
+{
+    /// Convert a borrowed fill payload into an owned [`Draw`].
+    #[must_use]
+    pub fn to_owned(self) -> Draw {
+        Draw::Fill {
+            transform: self.transform,
+            fill_rule: self.fill_rule,
+            brush: self.brush.into(),
+            brush_transform: self.brush_transform,
+            shape: self.shape.to_owned(),
+            composite: self.composite,
+        }
+    }
+}
+
 /// Borrowed stroke draw payload.
 #[derive(Clone, Debug, PartialEq)]
-pub struct StrokeRef<'a> {
+pub struct StrokeRef<'a, B = crate::Brush> {
     /// Geometry transform.
     pub transform: Affine,
     /// Stroke style.
     pub stroke: &'a Stroke,
     /// Brush used by this draw.
-    pub brush: BrushRef<'a>,
+    pub brush: B,
     /// Optional brush-space transform (for gradients/images).
     pub brush_transform: Option<Affine>,
     /// Geometry to stroke.
@@ -495,7 +508,7 @@ pub struct StrokeRef<'a> {
     pub composite: Composite,
 }
 
-impl<'a> StrokeRef<'a> {
+impl<'a, B> StrokeRef<'a, B> {
     /// Create a stroke draw with default state.
     ///
     /// Defaults:
@@ -503,11 +516,7 @@ impl<'a> StrokeRef<'a> {
     /// - brush transform: `None`
     /// - compositing: [`Composite::default()`]
     #[must_use]
-    pub fn new(
-        shape: impl Into<GeometryRef<'a>>,
-        stroke: &'a Stroke,
-        brush: impl Into<BrushRef<'a>>,
-    ) -> Self {
+    pub fn new(shape: impl Into<GeometryRef<'a>>, stroke: &'a Stroke, brush: impl Into<B>) -> Self {
         Self {
             transform: Affine::IDENTITY,
             stroke,
@@ -539,19 +548,6 @@ impl<'a> StrokeRef<'a> {
         self
     }
 
-    /// Convert a borrowed stroke payload into an owned [`Draw`].
-    #[must_use]
-    pub fn to_owned(self) -> Draw {
-        Draw::Stroke {
-            transform: self.transform,
-            stroke: self.stroke.clone(),
-            brush: self.brush.to_owned(),
-            brush_transform: self.brush_transform,
-            shape: self.shape.to_owned(),
-            composite: self.composite,
-        }
-    }
-
     #[must_use]
     pub(crate) fn prepend_transform(self, prefix: Affine) -> Self {
         Self {
@@ -561,9 +557,27 @@ impl<'a> StrokeRef<'a> {
     }
 }
 
+impl<'a, B> StrokeRef<'a, B>
+where
+    crate::Brush: From<B>,
+{
+    /// Convert a borrowed stroke payload into an owned [`Draw`].
+    #[must_use]
+    pub fn to_owned(self) -> Draw {
+        Draw::Stroke {
+            transform: self.transform,
+            stroke: self.stroke.clone(),
+            brush: self.brush.into(),
+            brush_transform: self.brush_transform,
+            shape: self.shape.to_owned(),
+            composite: self.composite,
+        }
+    }
+}
+
 /// Borrowed glyph run payload.
 #[derive(Clone, Debug, PartialEq)]
-pub struct GlyphRunRef<'a> {
+pub struct GlyphRunRef<'a, B = crate::Brush> {
     /// Font for all glyphs in the run.
     pub font: &'a peniko::FontData,
     /// Global run transform.
@@ -581,14 +595,14 @@ pub struct GlyphRunRef<'a> {
     /// Fill or stroke style for the glyphs.
     pub style: &'a Style,
     /// Brush used for the run.
-    pub brush: BrushRef<'a>,
+    pub brush: B,
     /// Optional transform from glyph-run local coordinates into brush coordinates.
     pub brush_transform: Option<Affine>,
     /// Per-draw compositing.
     pub composite: Composite,
 }
 
-impl<'a> GlyphRunRef<'a> {
+impl<'a, B> GlyphRunRef<'a, B> {
     /// Create a glyph run with default state.
     ///
     /// Defaults:
@@ -599,11 +613,7 @@ impl<'a> GlyphRunRef<'a> {
     /// - normalized variation coordinates: `&[]`
     /// - compositing: [`Composite::default()`]
     #[must_use]
-    pub fn new(
-        font: &'a peniko::FontData,
-        style: &'a Style,
-        brush: impl Into<BrushRef<'a>>,
-    ) -> Self {
+    pub fn new(font: &'a peniko::FontData, style: &'a Style, brush: impl Into<B>) -> Self {
         Self {
             font,
             transform: Affine::IDENTITY,
@@ -619,6 +629,19 @@ impl<'a> GlyphRunRef<'a> {
         }
     }
 
+    #[must_use]
+    pub(crate) fn prepend_transform(self, prefix: Affine) -> Self {
+        Self {
+            transform: prefix * self.transform,
+            ..self
+        }
+    }
+}
+
+impl<'a, B> GlyphRunRef<'a, B>
+where
+    crate::Brush: From<B>,
+{
     /// Convert a borrowed glyph run into an owned [`GlyphRun`].
     #[must_use]
     pub fn to_owned(self, glyphs: impl IntoIterator<Item = Glyph>) -> GlyphRun {
@@ -632,30 +655,22 @@ impl<'a> GlyphRunRef<'a> {
             normalized_coords: self.normalized_coords.to_vec(),
             style: self.style.clone(),
             glyphs: glyphs.into_iter().collect(),
-            brush: self.brush.to_owned(),
+            brush: self.brush.into(),
             brush_transform: self.brush_transform,
             composite: self.composite,
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn prepend_transform(self, prefix: Affine) -> Self {
-        Self {
-            transform: prefix * self.transform,
-            ..self
         }
     }
 }
 
 /// Borrowed draw payload.
 #[derive(Clone, Debug, PartialEq)]
-pub enum DrawRef<'a> {
+pub enum DrawRef<'a, B = crate::Brush> {
     /// Fill a shape.
     Fill(FillRef<'a>),
     /// Stroke a shape.
-    Stroke(StrokeRef<'a>),
+    Stroke(StrokeRef<'a, B>),
     /// Draw a positioned glyph run.
-    GlyphRun(GlyphRunRef<'a>),
+    GlyphRun(GlyphRunRef<'a, B>),
     /// Draw a solid-color rounded rectangle blurred with a gaussian filter.
     BlurredRoundedRect(BlurredRoundedRect),
     /// Replay a retained scene picture.
@@ -703,7 +718,10 @@ impl<'a> ContextRef<'a> {
     }
 }
 
-impl<'a> DrawRef<'a> {
+impl<'a, B> DrawRef<'a, B>
+where
+    crate::Brush: From<B>,
+{
     /// Convert a borrowed draw payload into an owned [`Draw`].
     #[must_use]
     pub fn to_owned(self, glyphs: impl IntoIterator<Item = Glyph>) -> Draw {
@@ -724,7 +742,7 @@ impl<'a> DrawRef<'a> {
 ///
 /// This trait is intended for streaming authoring APIs and backend/native recorders that can
 /// consume borrowed input directly.
-pub trait PaintSink {
+pub trait PaintSink<F = Filter, C = Composite, B = crate::Brush> {
     /// Push a context annotation onto the context stack.
     ///
     /// Default implementation: ignored.
@@ -738,21 +756,19 @@ pub trait PaintSink {
     /// Pop the most recently pushed non-isolated clip.
     fn pop_clip(&mut self);
     /// Push an isolated group onto the group stack.
-    fn push_group(&mut self, group: GroupRef<'_>);
+    fn push_group(&mut self, group: GroupRef<'_, F, C>);
     /// Pop the most recently pushed isolated group.
     fn pop_group(&mut self);
     /// Emit a fill draw.
-    fn fill(&mut self, draw: FillRef<'_>);
+    fn fill(&mut self, draw: FillRef<'_, B>);
     /// Emit a stroke draw.
-    fn stroke(&mut self, draw: StrokeRef<'_>);
+    fn stroke(&mut self, draw: StrokeRef<'_, B>);
     /// Emit a glyph run draw.
-    fn glyph_run(&mut self, draw: GlyphRunRef<'_>, glyphs: &mut dyn Iterator<Item = Glyph>);
+    fn glyph_run(&mut self, draw: GlyphRunRef<'_, B>, glyphs: &mut dyn Iterator<Item = Glyph>);
     /// Emit a blurred rounded rect draw.
     fn blurred_rounded_rect(&mut self, draw: BlurredRoundedRect);
     /// Replay a retained scene picture.
-    fn scene_picture(&mut self, picture: &ScenePicture, transform: Affine) {
-        replay_transformed(picture.scene(), self, transform);
-    }
+    fn scene_picture(&mut self, _picture: &ScenePicture, _transform: Affine) {}
 }
 
 impl Geometry {
@@ -867,7 +883,7 @@ impl Draw {
             } => DrawRef::Fill(FillRef {
                 transform: *transform,
                 fill_rule: *fill_rule,
-                brush: brush.into(),
+                brush: brush.clone(),
                 brush_transform: *brush_transform,
                 shape: shape.as_ref(),
                 composite: *composite,
